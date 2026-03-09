@@ -3232,7 +3232,7 @@ async def handle_admin_text(update, context, action, text):
 # ════════════════════════════════════════════
 MAX_UPLOAD_MB = 100  # max file size in MB
 _last_upload: dict[int, float] = {}
-_UPLOAD_COOLDOWN = 30.0  # seconds between uploads per admin
+_UPLOAD_COOLDOWN = 1  # seconds between uploads per admin
 
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
