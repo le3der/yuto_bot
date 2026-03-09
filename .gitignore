@@ -1,0 +1,5 @@
+.env
+scanner.db
+data_files/
+db_backups/
+__pycache__/
