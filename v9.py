@@ -14,6 +14,7 @@ import shutil
 import asyncio
 import sqlite3
 import logging
+import logging.handlers
 import zipfile
 import hashlib
 import threading
@@ -39,12 +40,28 @@ MIN_KEYWORD_LEN    = 3      # minimum search keyword length
 WHITELIST_MODE     = False  # if True, only whitelisted users can use the bot
 WHITELIST_IDS: set[int] = set()  # add user IDs here when WHITELIST_MODE=True
 BOT_START_TIME     = None   # set at runtime in main()
+MAINTENANCE_MODE   = False  # if True, bot shows maintenance message to non-admins
+MAINTENANCE_MSG    = "🔧 *Bot is under maintenance.*\n\nPlease try again later."
+MAX_RESULT_LINES   = 1000_000  # max lines in result file before truncation
 
 os.makedirs(FILES_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
+# ── Logging: console + rotating file for errors ──────────
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
+_log_dir = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(_log_dir, exist_ok=True)
+_fh = logging.handlers.RotatingFileHandler(
+    os.path.join(_log_dir, "bot_errors.log"),
+    maxBytes=5 * 1024 * 1024,  # 5 MB per file
+    backupCount=3,
+    encoding="utf-8"
+)
+_fh.setLevel(logging.WARNING)
+_fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+log.addHandler(_fh)
+logging.getLogger("telegram").addHandler(_fh)
 
 SEARCH_TIMEOUT = 180
 
@@ -53,8 +70,9 @@ _last_search_time: dict[int, float] = {}
 _rate_limit_lock  = threading.Lock()
 
 # ── Callback data store (prevents >64 byte overflow) ─
-_cb_store: dict[str, str] = {}
+_cb_store: dict[str, tuple] = {}   # key → (data, timestamp)
 _user_search_locks: dict[int, asyncio.Lock] = {}
+_CB_TTL = 3600  # seconds before a callback entry expires (1 hour)
 
 def _get_user_lock(uid: int) -> asyncio.Lock:
     """Get or create a per-user async lock to prevent concurrent search races."""
@@ -65,12 +83,21 @@ def _get_user_lock(uid: int) -> asyncio.Lock:
 def _cb_put(data: str) -> str:
     """Store long callback data and return a short key (max 16 chars)."""
     key = "cb_" + hashlib.md5(data.encode()).hexdigest()[:12]
-    _cb_store[key] = data
+    _cb_store[key] = (data, time.monotonic())
+    # Opportunistic cleanup: remove entries older than _CB_TTL
+    if len(_cb_store) > 500:
+        now_t = time.monotonic()
+        expired = [k for k, (_, ts) in list(_cb_store.items()) if now_t - ts > _CB_TTL]
+        for k in expired:
+            _cb_store.pop(k, None)
     return key
 
 def _cb_get(key: str) -> str:
     """Retrieve original callback data from short key, or return key as-is."""
-    return _cb_store.get(key, key)
+    entry = _cb_store.get(key)
+    if entry:
+        return entry[0]
+    return key
 
 # ════════════════════════════════════════════
 #           LANGUAGE STRINGS (i18n)
@@ -159,9 +186,9 @@ TIERS = {
 # max_nameid    : أقصى عدد نتايج في بحث Name/ID واحد
 NAMEID_TIERS = {
     "free":    {"daily_nameid": 0,      "max_nameid": 0},
-    "basic":   {"daily_nameid": 5,      "max_nameid": 50},
-    "premium": {"daily_nameid": 10,     "max_nameid": 500},
-    "vip":     {"daily_nameid": 100000, "max_nameid": 100000},
+    "basic":   {"daily_nameid": 2,      "max_nameid": 10},
+    "premium": {"daily_nameid": 5,     "max_nameid": 15},
+    "vip":     {"daily_nameid": 10, "max_nameid": 20},
 }
 
 # ════════════════════════════════════════════
@@ -231,6 +258,8 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN frozen_until TEXT DEFAULT NULL")
     if "updated_at" not in existing_cols:
         c.execute("ALTER TABLE users ADD COLUMN updated_at TEXT DEFAULT NULL")
+    if "last_search_type" not in existing_cols:
+        c.execute("ALTER TABLE users ADD COLUMN last_search_type TEXT DEFAULT NULL")
 
     # Migration: sub_requests table - add missing columns if needed
     sub_cols = [row[1] for row in c.execute("PRAGMA table_info(sub_requests)").fetchall()]
@@ -356,6 +385,15 @@ def init_db():
     uf_cols = [row[1] for row in c.execute("PRAGMA table_info(uploaded_files)").fetchall()]
     if "file_md5" not in uf_cols:
         c.execute("ALTER TABLE uploaded_files ADD COLUMN file_md5 TEXT DEFAULT NULL")
+
+    # ── Performance indexes ──────────────────────────────
+    c.execute("CREATE INDEX IF NOT EXISTS idx_search_logs_uid  ON search_logs(user_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_search_logs_ts   ON search_logs(timestamp)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_search_logs_cat  ON search_logs(category)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_users_tier       ON users(tier)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_users_banned     ON users(is_banned)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_users_expires    ON users(expires_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_uploaded_ts      ON uploaded_files(uploaded_at)")
 
     conn.commit()
     conn.close()
@@ -550,6 +588,12 @@ def log_search(uid, keyword, category, count):
             "INSERT INTO search_logs VALUES (?,?,?,?,?)",
             (uid, keyword, category, count, datetime.utcnow().isoformat())
         )
+        # Save last search type for smart keyboard ordering
+        if category and not category.startswith("nameid_"):
+            conn.execute(
+                "UPDATE users SET last_search_type=? WHERE user_id=?",
+                (category, uid)
+            )
 
 # ════════════════════════════════════════════
 #          RESULT COUNTER (NEW FEATURE)
@@ -780,6 +824,35 @@ def parse_line_fields(line: str) -> dict:
     line = line.strip()
     if not line:
         return {}
+    # Handle JSON object lines: {"email":"x","pass":"y","password":"z"}
+    if line.startswith("{") and line.endswith("}"):
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                result = {}
+                EMAIL_KEYS    = {"email", "mail", "e-mail", "e_mail"}
+                PASS_KEYS     = {"password", "pass", "passwd", "pwd", "secret"}
+                URL_KEYS      = {"url", "site", "domain", "host", "link", "website"}
+                USERNAME_KEYS = {"username", "user", "login", "name", "uname", "nick"}
+                PHONE_KEYS    = {"phone", "mobile", "tel", "cell", "number"}
+                for k, v in obj.items():
+                    kl = k.lower().strip()
+                    sv = str(v).strip() if v else ""
+                    if not sv or sv in ("null", "none", "nan"): continue
+                    if kl in EMAIL_KEYS and "email" not in result:
+                        result["email"] = sv
+                    elif kl in PASS_KEYS and "password" not in result:
+                        result["password"] = sv
+                    elif kl in URL_KEYS and "url" not in result:
+                        result["url"] = sv
+                    elif kl in USERNAME_KEYS and "username" not in result:
+                        result["username"] = sv
+                    elif kl in PHONE_KEYS and "phone" not in result:
+                        result["phone"] = sv
+                if result:
+                    return result
+        except (json.JSONDecodeError, Exception):
+            pass
     if "|" in line or ";" in line or "\t" in line:
         parts = [p.strip() for p in re.split(r"[|;\t]", line) if p.strip()]
     else:
@@ -927,6 +1000,13 @@ async def safe_send_document(send_fn, path: str, filename: str, caption: str, re
 
 def build_result_txt(keyword: str, results: list, stype: str) -> str:
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    # Truncate if too many results to prevent huge files
+    truncated = False
+    if len(results) > MAX_RESULT_LINES:
+        results = results[:MAX_RESULT_LINES]
+        truncated = True
+
     email_pass  = []
     email_only  = []
     url_combo   = []
@@ -960,7 +1040,7 @@ def build_result_txt(keyword: str, results: list, stype: str) -> str:
         "═" * 60,
         f"  📌 Target   : {keyword}",
         f"  📂 Type     : {stype.upper()}",
-        f"  📊 Total    : {total:,} records",
+        f"  📊 Total    : {total:,} records" + (" (truncated to 100K)" if truncated else ""),
         f"  📧 Email:Pass : {len(email_pass) + len(url_combo):,}",
         f"  👤 Login:Pass : {len(login_combo):,}",
         f"  📱 Phone      : {len(phone_list):,}",
@@ -968,6 +1048,8 @@ def build_result_txt(keyword: str, results: list, stype: str) -> str:
         f"  🤖 Bot        : @DataScannerBot",
         "═" * 60, "",
     ]
+    if truncated:
+        lines.insert(3, f"  ⚠️  Results exceeded {MAX_RESULT_LINES:,} — showing first {MAX_RESULT_LINES:,} only")
     if email_pass:
         lines += [f"{'─'*55}", f"  📧 EMAIL:PASS — {len(email_pass)} results", f"{'─'*55}"]
         for em, pwd in email_pass: lines.append(f"{em}:{pwd}")
@@ -987,7 +1069,7 @@ def build_result_txt(keyword: str, results: list, stype: str) -> str:
     if phone_list:
         lines += [f"{'─'*55}", f"  📱 PHONE — {len(phone_list)} results", f"{'─'*55}"]
         lines += phone_list + [""]
-    lines += ["═"*55, f"  ✅ Total: {total} clean records", "═"*55]
+    lines += ["═"*55, f"  ✅ Total: {total:,} clean records", "═"*55]
     return "\n".join(lines)
 
 def build_nameid_result_txt(keyword: str, results: list, qtype: str) -> str:
@@ -1016,6 +1098,20 @@ def build_nameid_result_txt(keyword: str, results: list, qtype: str) -> str:
 # ════════════════════════════════════════════
 #               FILE PARSING
 # ════════════════════════════════════════════
+def _open_text_file(path: str):
+    """Open a text file trying multiple encodings: UTF-8 → CP1256 (Arabic) → Latin-1."""
+    for enc in ("utf-8", "cp1256", "latin-1"):
+        try:
+            f = open(path, "r", encoding=enc, errors="strict")
+            f.read(512)   # probe first 512 bytes
+            f.seek(0)
+            return f, enc
+        except (UnicodeDecodeError, Exception):
+            try: f.close()
+            except: pass
+    # Last resort: utf-8 with replacement chars
+    return open(path, "r", encoding="utf-8", errors="replace"), "utf-8(replace)"
+
 def parse_file(path: str, original_name: str) -> list:
     results = []
     source  = original_name
@@ -1035,14 +1131,22 @@ def parse_file(path: str, original_name: str) -> list:
             results.append((line, source))
 
     if ext == "txt":
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        f, enc = _open_text_file(path)
+        log.info(f"Parsing TXT [{enc}]: {original_name}")
+        with f:
             for line in f:
                 add_line(line)
     elif ext == "csv":
-        try:
-            df = pd.read_csv(path, dtype=str, on_bad_lines="skip", encoding="utf-8")
-        except Exception:
-            df = pd.read_csv(path, dtype=str, on_bad_lines="skip", encoding="latin-1")
+        loaded = False
+        for enc in ("utf-8", "cp1256", "latin-1"):
+            try:
+                df = pd.read_csv(path, dtype=str, on_bad_lines="skip", encoding=enc)
+                loaded = True
+                break
+            except (UnicodeDecodeError, Exception):
+                continue
+        if not loaded:
+            df = pd.read_csv(path, dtype=str, on_bad_lines="skip", encoding="latin-1", errors="replace")
         for _, row in df.iterrows():
             vals = [str(v).strip() for v in row if pd.notna(v) and str(v).strip()]
             if vals: add_line(":".join(vals))
@@ -1052,11 +1156,23 @@ def parse_file(path: str, original_name: str) -> list:
             vals = [str(v).strip() for v in row if pd.notna(v) and str(v).strip()]
             if vals: add_line(":".join(vals))
     elif ext == "json":
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            data = json.load(f)
+        f, enc = _open_text_file(path)
+        with f:
+            raw = f.read()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # Try JSONL (one JSON object per line)
+            data = []
+            for ln in raw.splitlines():
+                ln = ln.strip()
+                if ln:
+                    try: data.append(json.loads(ln))
+                    except: pass
         def flatten(obj):
             if isinstance(obj, dict):
-                yield ":".join(str(v) for v in obj.values() if v)
+                # Emit the whole record as a structured line
+                yield json.dumps(obj, ensure_ascii=False)
                 for v in obj.values(): yield from flatten(v)
             elif isinstance(obj, list):
                 for item in obj: yield from flatten(item)
@@ -1099,24 +1215,35 @@ def user_main_kb(uid: int = 0):
                 rows.insert(3, [InlineKeyboardButton(renew_label, callback_data="user_subscribe")])
     return InlineKeyboardMarkup(rows)
 
-def search_type_kb():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🌐 URL",      callback_data="st_url"),
-            InlineKeyboardButton("🌍 Domain",   callback_data="st_domain"),
-        ],
-        [
-            InlineKeyboardButton("👤 Login",    callback_data="st_login"),
-            InlineKeyboardButton("📝 Username", callback_data="st_username"),
-        ],
-        [
-            InlineKeyboardButton("📧 Email",    callback_data="st_email"),
-            InlineKeyboardButton("📱 Phone",    callback_data="st_phone"),
-        ],
-        [InlineKeyboardButton("🔑 Password",    callback_data="st_password")],
+def search_type_kb(uid: int = 0):
+    # Fetch last search type for smart ordering
+    last_type = None
+    if uid:
+        with sqlite3.connect(DB_FILE) as conn:
+            row = conn.execute("SELECT last_search_type FROM users WHERE user_id=?", (uid,)).fetchone()
+            last_type = row[0] if row and row[0] else None
+
+    type_buttons = {
+        "url":      InlineKeyboardButton("🌐 URL",      callback_data="st_url"),
+        "domain":   InlineKeyboardButton("🌍 Domain",   callback_data="st_domain"),
+        "login":    InlineKeyboardButton("👤 Login",    callback_data="st_login"),
+        "username": InlineKeyboardButton("📝 Username", callback_data="st_username"),
+        "email":    InlineKeyboardButton("📧 Email",    callback_data="st_email"),
+        "phone":    InlineKeyboardButton("📱 Phone",    callback_data="st_phone"),
+        "password": InlineKeyboardButton("🔑 Password", callback_data="st_password"),
+    }
+    rows = []
+    if last_type and last_type in type_buttons:
+        rows.append([InlineKeyboardButton(f"⭐ Last: {last_type.upper()}", callback_data=f"st_{last_type}")])
+    rows += [
+        [type_buttons["url"], type_buttons["domain"]],
+        [type_buttons["login"], type_buttons["username"]],
+        [type_buttons["email"], type_buttons["phone"]],
+        [type_buttons["password"]],
         [InlineKeyboardButton("🔎 Full Scan 👑", callback_data="st_all")],
         [InlineKeyboardButton("🔙 Back",         callback_data="user_home")],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 def nameid_type_kb():
     return InlineKeyboardMarkup([
@@ -1136,7 +1263,16 @@ def new_search_kb():
         [InlineKeyboardButton("🏠 Main Menu",      callback_data="user_home")],
     ])
 
+def result_share_kb():
+    """Keyboard shown after search result is sent — includes forward hint."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 New Search",        callback_data="go_search")],
+        [InlineKeyboardButton("💾 Save to Saved Msgs", url="tg://msg?text=forward")],
+        [InlineKeyboardButton("🏠 Main Menu",          callback_data="user_home")],
+    ])
+
 def admin_main_kb():
+    maint_label = "🔧 Maintenance: ON ✅" if MAINTENANCE_MODE else "🔧 Maintenance: OFF"
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🔍 Search DB",      callback_data="go_search"),
@@ -1182,6 +1318,7 @@ def admin_main_kb():
         [InlineKeyboardButton("📋 طلبات الاشتراك",   callback_data="adm_sub_requests")],
         [InlineKeyboardButton("📜 سجل عمليات الأدمن", callback_data="adm_op_logs")],
         [InlineKeyboardButton("⚡ Bot Status",        callback_data="adm_bot_status")],
+        [InlineKeyboardButton(maint_label,            callback_data="adm_toggle_maintenance")],
     ])
 
 def back_admin_kb():
@@ -1192,6 +1329,11 @@ def back_admin_kb():
 # ════════════════════════════════════════════
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+
+    # MAINTENANCE check — admins always bypass
+    if MAINTENANCE_MODE and not is_admin(user.id):
+        await update.message.reply_text(MAINTENANCE_MSG, parse_mode="Markdown"); return
+
     is_new = get_user(user.id) is None
 
     # WHITELIST check
@@ -1444,12 +1586,36 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         lang = get_lang(uid)
         is_ar = lang == "ar"
-        tier     = TIERS.get(u[3], TIERS["free"])
+        tier_d   = TIERS.get(u[3], TIERS["free"])
         username = esc(u[1] or "N/A")
         fullname = esc(u[2] or "User")
         daily    = u[4]
         credits  = u[5]
         exp      = esc(u[7] or ("لا يوجد انتهاء" if is_ar else "No expiry"))
+        tier_name = u[3]
+
+        # Build daily limit progress bar
+        max_daily = TIERS.get(tier_name, TIERS["free"])["daily"]
+        used      = max(0, max_daily - daily) if max_daily > 0 else 0
+        if max_daily > 0 and max_daily < 100_000:
+            pct   = min(100, int(used / max_daily * 100))
+            bars  = int(pct / 10)
+            bar   = "█" * bars + "░" * (10 - bars)
+            daily_bar = f"`{bar}` {pct}% ({used}/{max_daily})"
+        else:
+            daily_bar = f"`{daily}` {'متبقي' if is_ar else 'remaining'}"
+
+        # Name/ID usage
+        max_ni  = NAMEID_TIERS.get(tier_name, NAMEID_TIERS["free"])["daily_nameid"]
+        ni_left = u[13] if len(u) > 13 else 0
+        ni_used = max(0, max_ni - ni_left) if max_ni > 0 else 0
+        if max_ni > 0 and max_ni < 100_000:
+            ni_pct  = min(100, int(ni_used / max_ni * 100))
+            ni_bars = int(ni_pct / 10)
+            ni_bar  = f"`{'█'*ni_bars}{'░'*(10-ni_bars)}` {ni_pct}% ({ni_used}/{max_ni})"
+        else:
+            ni_bar  = f"`{ni_left}` {'متبقي' if is_ar else 'remaining'}"
+
         if is_ar:
             text = (
                 f"📊 <b>حسابي</b>\n"
@@ -1458,8 +1624,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🔖 المعرف   : @{username}\n"
                 f"🆔 المعرف الرقمي: <code>{uid}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📦 الباقة   : {esc(tier['label'])}\n"
-                f"🔍 اليومي   : <code>{daily}</code> بحث متبقي\n"
+                f"📦 الباقة   : {esc(tier_d['label'])}\n"
+                f"🔍 البحث اليومي:\n  {daily_bar}\n"
+                f"🪪 Name/ID اليومي:\n  {ni_bar}\n"
                 f"💰 الرصيد   : <code>{credits}</code>\n"
                 f"📅 الانتهاء : <code>{exp}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━"
@@ -1472,8 +1639,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🔖 Username: @{username}\n"
                 f"🆔 User ID : <code>{uid}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📦 Plan    : {esc(tier['label'])}\n"
-                f"🔍 Daily   : <code>{daily}</code> searches left\n"
+                f"📦 Plan    : {esc(tier_d['label'])}\n"
+                f"🔍 Daily Search:\n  {daily_bar}\n"
+                f"🪪 Daily Name/ID:\n  {ni_bar}\n"
                 f"💰 Credits : <code>{credits}</code>\n"
                 f"📅 Expires : <code>{exp}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━"
@@ -1517,7 +1685,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "go_search":
         await q.edit_message_text(
             "🔍 *Choose Search Type*\n\nSelect the type of data you want to search for:",
-            parse_mode="Markdown", reply_markup=search_type_kb()
+            parse_mode="Markdown", reply_markup=search_type_kb(uid)
         ); return
 
     if data.startswith("st_"):
@@ -1713,13 +1881,24 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ts = conn.execute("SELECT COUNT(*) FROM search_logs").fetchone()[0]
             tf = conn.execute("SELECT COUNT(*) FROM uploaded_files").fetchone()[0]
             tc = conn.execute("SELECT tier, COUNT(*) FROM users GROUP BY tier").fetchall()
-        tier_lines = "\n".join([f"    {t}: `{c}`" for t, c in tc])
+            # Upload stats
+            up_stats = conn.execute(
+                "SELECT COALESCE(SUM(size_bytes),0), COALESCE(MAX(size_bytes),0), "
+                "COALESCE(AVG(records),0), COALESCE(MAX(records),0) FROM uploaded_files"
+            ).fetchone()
+            total_sz, max_sz, avg_recs, max_recs = up_stats
+        tier_lines = "\n".join([f"  {t}: `{c}`" for t, c in tc])
         await q.edit_message_text(
             f"📊 *Bot Statistics*\n━━━━━━━━━━━━━━━━━━━━━━\n"
             f"👥 Users: `{tu:,}` | 🚫 Banned: `{tb}`\n"
             f"🗄️ DB Records: `{tr:,}` | 🪪 Name/ID: `{tn:,}`\n"
             f"📁 Files: `{tf}` | 🔍 Searches: `{ts:,}`\n\n"
-            f"📦 *Tier Breakdown:*\n{tier_lines}",
+            f"📦 *Tier Breakdown:*\n{tier_lines}\n\n"
+            f"📂 *Upload Stats:*\n"
+            f"  💾 Total size: `{round(total_sz/1024/1024, 1)} MB`\n"
+            f"  📄 Largest file: `{round(max_sz/1024/1024, 2)} MB`\n"
+            f"  📊 Avg records/file: `{int(avg_recs):,}`\n"
+            f"  🏆 Max records: `{int(max_recs):,}`",
             parse_mode="Markdown", reply_markup=back_admin_kb()
         ); return
 
@@ -2189,6 +2368,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown", reply_markup=back_admin_kb()
         ); return
 
+    if data == "adm_toggle_maintenance":
+        global MAINTENANCE_MODE
+        MAINTENANCE_MODE = not MAINTENANCE_MODE
+        status = "🔧 *Maintenance mode ENABLED.*\n\nAll non-admin users will see the maintenance message." if MAINTENANCE_MODE \
+            else "✅ *Maintenance mode DISABLED.*\n\nBot is open to all users again."
+        await q.edit_message_text(status, parse_mode="Markdown", reply_markup=back_admin_kb()); return
+
     action_map = {
         "adm_add_credits": ("add_credits", "💰 *Add / Deduct Credits*\n\nSend: `USER_ID AMOUNT`\nExample: `123456789 500`\n\n_Use negative to deduct: `123456789 -50`_"),
         "adm_set_tier":    ("set_tier",    f"⬆️ *Set User Tier*\n\nSend: `USER_ID TIER`\n\nTiers: `free` | `basic` | `premium` | `vip`"),
@@ -2291,10 +2477,15 @@ async def show_search_counter(update: Update, context: ContextTypes.DEFAULT_TYPE
     icon = icons.get(stype, "🔍")
 
     if raw_count == 0:
+        alt_types = [t for t in ["email","url","domain","login","username","phone","password","all"] if t != stype]
+        suggestions = " | ".join(f"`{t}`" for t in alt_types[:4])
         await msg.edit_text(
             f"🔍 *No results found*\n\n"
             f"Target: `{mesc(keyword)}` | Type: `{stype.upper()}`\n\n"
-            f"Try a different keyword or search type.",
+            f"💡 *Suggestions:*\n"
+            f"• Try a shorter keyword\n"
+            f"• Try a different search type: {suggestions}\n"
+            f"• Use `Full Scan` to search all types at once",
             parse_mode="Markdown", reply_markup=new_search_kb()
         ); return
 
@@ -2412,13 +2603,27 @@ async def show_nameid_counter(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if raw_count == 0:
         await msg.edit_text(
-            f"🔍 *لا توجد نتائج*\n\nQuery: `{mesc(query)}`\n\nجرب كلمة أو رقم مختلف.",
+            f"🔍 *لا توجد نتائج*\n\n"
+            f"Query: `{mesc(query)}`\n\n"
+            f"💡 *اقتراحات:*\n"
+            f"• جرب اسماً أقصر أو جزءاً من الرقم\n"
+            f"• تأكد من الإملاء الصحيح",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🪪 بحث جديد", callback_data="go_nameid")],
                 [InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")],
             ])
         ); return
+
+    # Fetch 3 preview results (fast, no deduction)
+    preview_results = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: search_by_name(query, 3) if qtype == "name" else search_by_national_id(query, 3)
+    )
+    preview_lines = ""
+    if preview_results:
+        preview_lines = "\n\n👁️ *معاينة (أول 3):*\n"
+        for r in preview_results[:3]:
+            preview_lines += f"• 👤 `{mesc(r.get('name','')[:25])}` | 🪪 `{r.get('national_id','')}`\n"
 
     safe_q     = query[:40]
     cb_confirm = _cb_put(f"confirm_nameid:{stype}:{safe_q}")
@@ -2431,7 +2636,8 @@ async def show_nameid_counter(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"📂 Type   : {type_labels[qtype]}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 متاح   : `{raw_count:,}` سجل\n"
-        f"✅ حدك    : `{capped:,}` سجل\n"
+        f"✅ حدك    : `{capped:,}` سجل"
+        f"{preview_lines}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"اضغط *تحميل* للحصول على الملف.",
         parse_mode="Markdown",
@@ -2593,10 +2799,15 @@ async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE,
         log_search(uid, keyword, stype, len(results))
 
         if not results:
+            alt_types = [t for t in ["email","url","domain","login","username","phone","password","all"] if t != stype]
+            suggestions = " | ".join(f"`{t}`" for t in alt_types[:4])
             await msg.edit_text(
                 f"🔍 *No results found*\n\n"
                 f"Target: `{mesc(keyword)}` | Type: `{stype.upper()}`\n\n"
-                f"Try a different keyword or search type.",
+                f"💡 *Suggestions:*\n"
+                f"• Try a shorter keyword\n"
+                f"• Try a different type: {suggestions}\n"
+                f"• Use `Full Scan` to search all types",
                 parse_mode="Markdown", reply_markup=new_search_kb()
             ); return
 
@@ -3328,6 +3539,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=user_main_kb(update.effective_user.id)
     )
 
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check bot latency."""
+    t0 = time.monotonic()
+    msg = await update.message.reply_text("🏓 Pong!")
+    latency_ms = round((time.monotonic() - t0) * 1000)
+    await msg.edit_text(
+        f"🏓 *Pong!*\n"
+        f"⚡ Latency: `{latency_ms}ms`\n"
+        f"🟢 Bot is online.",
+        parse_mode="Markdown"
+    )
+
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show bot version and uptime."""
     uptime_str = "N/A"
@@ -3391,19 +3614,40 @@ async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #         GLOBAL ERROR HANDLER
 # ════════════════════════════════════════════
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.error("Exception while handling update:", exc_info=context.error)
+    err_type = type(context.error).__name__
+    err_msg  = str(context.error)
+    log.error(f"Unhandled exception [{err_type}]: {err_msg}", exc_info=context.error)
+
+    # Friendly message to user
     if isinstance(update, Update) and update.effective_message:
+        uid_ctx = update.effective_user.id if update.effective_user else "?"
         try:
-            await update.effective_message.reply_text(
-                "⚠️ An error occurred. Please try again or press /start."
-            )
+            if isinstance(context.error, (BadRequest, TelegramError)):
+                user_msg = "⚠️ *Telegram error* — please try again."
+            elif isinstance(context.error, asyncio.TimeoutError):
+                user_msg = "⏱️ *Request timed out.* The search took too long. Try a more specific keyword."
+            else:
+                user_msg = "⚠️ *Unexpected error.* Please press /start and try again.\n\nIf it keeps happening, contact the admin."
+            await update.effective_message.reply_text(user_msg, parse_mode="Markdown")
         except Exception:
             pass
-    # Notify admins
-    err_text = f"⚠️ *Bot Error*\n\n`{mesc(type(context.error).__name__)}: {mesc(str(context.error)[:300])}`"
+    else:
+        uid_ctx = "N/A"
+
+    # Notify admins with details
+    import traceback
+    tb_str = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
+    err_text = (
+        f"⚠️ *Bot Error*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 User: `{uid_ctx}`\n"
+        f"🔴 Error: `{mesc(err_type)}`\n"
+        f"📝 Message: `{mesc(err_msg[:200])}`\n\n"
+        f"```\n{mesc(tb_str[-500:])}\n```"
+    )
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(chat_id=admin_id, text=err_text, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=admin_id, text=err_text[:4000], parse_mode="Markdown")
         except Exception:
             pass
 
@@ -3521,6 +3765,7 @@ def main():
     app.add_handler(CommandHandler("id",        cmd_id))
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
     app.add_handler(CommandHandler("version",   cmd_version))
+    app.add_handler(CommandHandler("ping",      cmd_ping))
     app.add_handler(CommandHandler("finduser",  cmd_finduser))
     app.add_handler(CommandHandler("stats",     cmd_stats))
     app.add_handler(CommandHandler("adduser",   cmd_adduser))
