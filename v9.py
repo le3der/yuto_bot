@@ -1,3 +1,6 @@
+import psycopg2
+import psycopg2.extras
+
 """
 ╔══════════════════════════════════════════════════════╗
 ║         DATA SCANNER BOT v5.0 — FULL UPGRADE        ║
@@ -12,7 +15,6 @@ import time
 import signal
 import shutil
 import asyncio
-import sqlite3
 import logging
 import logging.handlers
 import zipfile
@@ -32,29 +34,28 @@ from telegram.ext import (
 # ════════════════════════════════════════════
 TOKEN       = os.environ.get("BOT_TOKEN")
 ADMIN_IDS   = [int(x) for x in os.environ.get("ADMIN_IDS", "8546436162").split(",")]
-DB_FILE     = os.path.join(os.path.dirname(__file__), "scanner.db")
 FILES_DIR   = "data_files"
 BACKUP_DIR  = "db_backups"
-REFERRAL_CREDITS   = 3      # credits per successful referral
-MIN_KEYWORD_LEN    = 3      # minimum search keyword length
-WHITELIST_MODE     = False  # if True, only whitelisted users can use the bot
-WHITELIST_IDS: set[int] = set()  # add user IDs here when WHITELIST_MODE=True
-BOT_START_TIME     = None   # set at runtime in main()
-MAINTENANCE_MODE   = False  # if True, bot shows maintenance message to non-admins
+REFERRAL_CREDITS   = 3
+MIN_KEYWORD_LEN    = 3
+WHITELIST_MODE     = False
+WHITELIST_IDS: set = set()
+BOT_START_TIME     = None
+MAINTENANCE_MODE   = False
 MAINTENANCE_MSG    = "🔧 *Bot is under maintenance.*\n\nPlease try again later."
-MAX_RESULT_LINES   = 1000_000  # max lines in result file before truncation
+MAX_RESULT_LINES   = 1_000_000
 
 os.makedirs(FILES_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
-# ── Logging: console + rotating file for errors ──────────
+# ── Logging ───────────────────────────────────────────────
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 _log_dir = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(_log_dir, exist_ok=True)
 _fh = logging.handlers.RotatingFileHandler(
     os.path.join(_log_dir, "bot_errors.log"),
-    maxBytes=5 * 1024 * 1024,  # 5 MB per file
+    maxBytes=5 * 1024 * 1024,
     backupCount=3,
     encoding="utf-8"
 )
@@ -65,26 +66,37 @@ logging.getLogger("telegram").addHandler(_fh)
 
 SEARCH_TIMEOUT = 180
 
-# ── In-memory rate limit (faster than DB query) ──────
-_last_search_time: dict[int, float] = {}
+_last_search_time: dict = {}
 _rate_limit_lock  = threading.Lock()
 
-# ── Callback data store (prevents >64 byte overflow) ─
-_cb_store: dict[str, tuple] = {}   # key → (data, timestamp)
-_user_search_locks: dict[int, asyncio.Lock] = {}
-_CB_TTL = 3600  # seconds before a callback entry expires (1 hour)
+_cb_store: dict = {}
+_user_search_locks: dict = {}
+_CB_TTL = 3600
+
+# ════════════════════════════════════════════
+#           DATABASE CONNECTION
+# ════════════════════════════════════════════
+DB_CONFIG = {
+    "dbname":   os.environ.get("DB_NAME",     "scanner"),
+    "user":     os.environ.get("DB_USER",     "postgres"),
+    "password": os.environ.get("DB_PASSWORD", "123456"),
+    "host":     os.environ.get("DB_HOST",     "127.0.0.1"),
+    "port":     os.environ.get("DB_PORT",     "5432"),
+}
+
+def get_db():
+    """Return a new psycopg2 connection."""
+    return psycopg2.connect(**DB_CONFIG)
+
 
 def _get_user_lock(uid: int) -> asyncio.Lock:
-    """Get or create a per-user async lock to prevent concurrent search races."""
     if uid not in _user_search_locks:
         _user_search_locks[uid] = asyncio.Lock()
     return _user_search_locks[uid]
 
 def _cb_put(data: str) -> str:
-    """Store long callback data and return a short key (max 16 chars)."""
     key = "cb_" + hashlib.md5(data.encode()).hexdigest()[:12]
     _cb_store[key] = (data, time.monotonic())
-    # Opportunistic cleanup: remove entries older than _CB_TTL
     if len(_cb_store) > 500:
         now_t = time.monotonic()
         expired = [k for k, (_, ts) in list(_cb_store.items()) if now_t - ts > _CB_TTL]
@@ -93,7 +105,6 @@ def _cb_put(data: str) -> str:
     return key
 
 def _cb_get(key: str) -> str:
-    """Retrieve original callback data from short key, or return key as-is."""
     entry = _cb_store.get(key)
     if entry:
         return entry[0]
@@ -164,13 +175,16 @@ STRINGS = {
 }
 
 def get_lang(uid: int) -> str:
-    """Return user's language preference, default 'en'."""
-    with sqlite3.connect(DB_FILE) as conn:
-        row = conn.execute("SELECT lang FROM users WHERE user_id=?", (uid,)).fetchone()
-        return (row[0] if row and row[0] else "en")
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT lang FROM users WHERE user_id=%s", (uid,))
+                row = cur.fetchone()
+        return row[0] if row and row[0] else "en"
+    except Exception:
+        return "en"
 
 def s(uid: int, key: str) -> str:
-    """Get localized string for user."""
     lang = get_lang(uid)
     return STRINGS.get(lang, STRINGS["en"]).get(key, STRINGS["en"].get(key, key))
 
@@ -181,270 +195,183 @@ TIERS = {
     "vip":     {"label": "👑 VIP",     "daily": 100000, "max_results": 1000000, "full_scan": True},
 }
 
-# ── Name/ID Search — إعدادات منفصلة تماماً ──────────────
-# daily_nameid  : عدد بحوث Name/ID في اليوم (منفصل عن Search DB)
-# max_nameid    : أقصى عدد نتايج في بحث Name/ID واحد
 NAMEID_TIERS = {
-    "free":    {"daily_nameid": 0,      "max_nameid": 0},
-    "basic":   {"daily_nameid": 2,      "max_nameid": 10},
-    "premium": {"daily_nameid": 5,     "max_nameid": 15},
+    "free":    {"daily_nameid": 0,  "max_nameid": 0},
+    "basic":   {"daily_nameid": 2,  "max_nameid": 10},
+    "premium": {"daily_nameid": 5,  "max_nameid": 15},
     "vip":     {"daily_nameid": 10, "max_nameid": 20},
 }
 
 # ════════════════════════════════════════════
-#                  DATABASE
+#                  DATABASE INIT
 # ════════════════════════════════════════════
-def db_connect():
-    """Open DB with WAL mode and busy timeout pre-set."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    return conn
-
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+    conn = get_db()
+    cur  = conn.cursor()
 
-    # Enable WAL mode for concurrent reads/writes + set busy timeout
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA busy_timeout=5000")
-    c.execute("PRAGMA synchronous=NORMAL")  # safe with WAL, faster than FULL
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        full_name TEXT,
-        tier TEXT DEFAULT 'free',
-        daily_limit INTEGER DEFAULT 5,
-        credits INTEGER DEFAULT 0,
-        is_banned INTEGER DEFAULT 0,
-        expires_at TEXT,
-        joined_at TEXT,
-        lang TEXT DEFAULT 'en',
-        referred_by INTEGER DEFAULT NULL,
-        referral_count INTEGER DEFAULT 0,
-        last_search_at TEXT DEFAULT NULL,
-        daily_nameid_limit INTEGER DEFAULT 0
-    )
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            tier TEXT DEFAULT 'free',
+            daily_limit INTEGER DEFAULT 5,
+            credits INTEGER DEFAULT 0,
+            is_banned INTEGER DEFAULT 0,
+            expires_at TEXT,
+            joined_at TEXT,
+            lang TEXT DEFAULT 'en',
+            referred_by BIGINT DEFAULT NULL,
+            referral_count INTEGER DEFAULT 0,
+            last_search_at TEXT DEFAULT NULL,
+            daily_nameid_limit INTEGER DEFAULT 0,
+            frozen_until TEXT DEFAULT NULL,
+            updated_at TEXT DEFAULT NULL,
+            last_search_type TEXT DEFAULT NULL
+        )
     """)
 
-    cols = [row[1] for row in c.execute("PRAGMA table_info(data_index)").fetchall()]
-    if "content" in cols:
-        c.execute("DROP TABLE data_index")
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS data_index (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        line TEXT NOT NULL,
-        source TEXT
-    )
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS data_index (
+            id BIGSERIAL PRIMARY KEY,
+            line TEXT NOT NULL,
+            source TEXT
+        )
     """)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_line ON data_index(line)")
 
-    # Migration: add lang column if not exists
-    existing_cols = [row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()]
-    if "lang" not in existing_cols:
-        c.execute("ALTER TABLE users ADD COLUMN lang TEXT DEFAULT 'en'")
-    if "referred_by" not in existing_cols:
-        c.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER DEFAULT NULL")
-    if "referral_count" not in existing_cols:
-        c.execute("ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0")
-    if "last_search_at" not in existing_cols:
-        c.execute("ALTER TABLE users ADD COLUMN last_search_at TEXT DEFAULT NULL")
-    if "daily_nameid_limit" not in existing_cols:
-        c.execute("ALTER TABLE users ADD COLUMN daily_nameid_limit INTEGER DEFAULT 0")
-    if "frozen_until" not in existing_cols:
-        c.execute("ALTER TABLE users ADD COLUMN frozen_until TEXT DEFAULT NULL")
-    if "updated_at" not in existing_cols:
-        c.execute("ALTER TABLE users ADD COLUMN updated_at TEXT DEFAULT NULL")
-    if "last_search_type" not in existing_cols:
-        c.execute("ALTER TABLE users ADD COLUMN last_search_type TEXT DEFAULT NULL")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS name_id_index (
+            id BIGSERIAL PRIMARY KEY,
+            full_name TEXT NOT NULL,
+            national_id TEXT NOT NULL,
+            source TEXT
+        )
+    """)
 
-    # Migration: sub_requests table - add missing columns if needed
-    sub_cols = [row[1] for row in c.execute("PRAGMA table_info(sub_requests)").fetchall()]
-    if not sub_cols:
-        # Table doesn't exist yet - create it fresh
-        c.execute("""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS uploaded_files (
+            id SERIAL PRIMARY KEY,
+            saved_name TEXT,
+            original_name TEXT,
+            size_bytes BIGINT,
+            records INTEGER DEFAULT 0,
+            uploaded_by BIGINT,
+            uploaded_at TEXT,
+            file_md5 TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS search_logs (
+            user_id BIGINT,
+            keyword TEXT,
+            category TEXT,
+            results INTEGER,
+            timestamp TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sub_history (
+            user_id BIGINT,
+            tier TEXT,
+            amount INTEGER,
+            admin_id BIGINT,
+            timestamp TEXT,
+            referral_source BIGINT DEFAULT NULL
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS sub_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             username TEXT,
             full_name TEXT,
             requested_tier TEXT,
             status TEXT DEFAULT 'pending',
             timestamp TEXT
         )
-        """)
-    else:
-        if "username" not in sub_cols:
-            c.execute("ALTER TABLE sub_requests ADD COLUMN username TEXT DEFAULT ''")
-        if "full_name" not in sub_cols:
-            c.execute("ALTER TABLE sub_requests ADD COLUMN full_name TEXT DEFAULT ''")
-        if "requested_tier" not in sub_cols:
-            c.execute("ALTER TABLE sub_requests ADD COLUMN requested_tier TEXT DEFAULT 'basic'")
-        if "status" not in sub_cols:
-            c.execute("ALTER TABLE sub_requests ADD COLUMN status TEXT DEFAULT 'pending'")
-        if "timestamp" not in sub_cols:
-            c.execute("ALTER TABLE sub_requests ADD COLUMN timestamp TEXT DEFAULT ''")
+    """)
 
-    # Migration: admin_op_logs table
-    op_cols = [row[1] for row in c.execute("PRAGMA table_info(admin_op_logs)").fetchall()]
-    if not op_cols:
-        c.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS admin_op_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            admin_id BIGINT,
             action TEXT,
             target TEXT,
             details TEXT,
             timestamp TEXT
         )
-        """)
-    else:
-        if "details" not in op_cols:
-            c.execute("ALTER TABLE admin_op_logs ADD COLUMN details TEXT DEFAULT ''")
-        if "timestamp" not in op_cols:
-            c.execute("ALTER TABLE admin_op_logs ADD COLUMN timestamp TEXT DEFAULT ''")
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS name_id_index (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        full_name TEXT NOT NULL,
-        national_id TEXT NOT NULL,
-        source TEXT
-    )
-    """)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_name   ON name_id_index(full_name)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_nat_id ON name_id_index(national_id)")
-
-    # FTS5 virtual table for fast Arabic name search
-    c.execute("""
-    CREATE VIRTUAL TABLE IF NOT EXISTS name_fts
-    USING fts5(full_name, national_id, content='name_id_index', content_rowid='id')
     """)
 
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS uploaded_files (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        saved_name TEXT,
-        original_name TEXT,
-        size_bytes INTEGER,
-        records INTEGER DEFAULT 0,
-        uploaded_by INTEGER,
-        uploaded_at TEXT,
-        file_md5 TEXT
-    )
-    """)
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS search_logs (
-        user_id INTEGER,
-        keyword TEXT,
-        category TEXT,
-        results INTEGER,
-        timestamp TEXT
-    )
-    """)
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sub_history (
-        user_id INTEGER,
-        tier TEXT,
-        amount INTEGER,
-        admin_id INTEGER,
-        timestamp TEXT,
-        referral_source INTEGER DEFAULT NULL
-    )
-    """)
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS sub_requests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        username TEXT,
-        full_name TEXT,
-        requested_tier TEXT,
-        status TEXT DEFAULT 'pending',
-        timestamp TEXT
-    )
-    """)
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS admin_op_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        admin_id INTEGER,
-        action TEXT,
-        target TEXT,
-        details TEXT,
-        timestamp TEXT
-    )
-    """)
-
-    # Migration: add file_md5 to uploaded_files if missing
-    uf_cols = [row[1] for row in c.execute("PRAGMA table_info(uploaded_files)").fetchall()]
-    if "file_md5" not in uf_cols:
-        c.execute("ALTER TABLE uploaded_files ADD COLUMN file_md5 TEXT DEFAULT NULL")
-
-    # ── Performance indexes ──────────────────────────────
-    c.execute("CREATE INDEX IF NOT EXISTS idx_search_logs_uid  ON search_logs(user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_search_logs_ts   ON search_logs(timestamp)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_search_logs_cat  ON search_logs(category)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_users_tier       ON users(tier)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_users_banned     ON users(is_banned)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_users_expires    ON users(expires_at)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_uploaded_ts      ON uploaded_files(uploaded_at)")
+    # Indexes
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_search_logs_uid  ON search_logs(user_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_search_logs_ts   ON search_logs(timestamp)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_search_logs_cat  ON search_logs(category)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_tier       ON users(tier)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_banned     ON users(is_banned)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_expires    ON users(expires_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_uploaded_ts      ON uploaded_files(uploaded_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_data_line        ON data_index USING gin(to_tsvector('simple', line))")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nameid_name      ON name_id_index(full_name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nameid_id        ON name_id_index(national_id)")
 
     conn.commit()
+    cur.close()
     conn.close()
 
 # ════════════════════════════════════════════
 #                   HELPERS
 # ════════════════════════════════════════════
-def db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row   # ← FIX: access columns by name or index safely
-    return conn
-
 def get_user(uid):
-    with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-        # Return as plain tuple so existing indexing still works
-        return tuple(row) if row else None
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM users WHERE user_id=%s", (uid,))
+                row = cur.fetchone()
+        return row
+    except Exception as e:
+        log.error(f"get_user error: {e}")
+        return None
 
 def ensure_user(uid, username, full_name):
     now_iso = datetime.utcnow().isoformat()
-    with sqlite3.connect(DB_FILE) as conn:
-        if not conn.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone():
-            conn.execute(
-                "INSERT INTO users (user_id, username, full_name, tier, daily_limit, credits, is_banned, expires_at, joined_at, lang, referred_by, referral_count, last_search_at, daily_nameid_limit, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (uid, username or "", full_name or "User", "free", 5, 0, 0, None, now_iso, "en", None, 0, None, NAMEID_TIERS["free"]["daily_nameid"], now_iso)
-            )
-        else:
-            # Update username/full_name and updated_at if changed
-            conn.execute(
-                "UPDATE users SET username=?, full_name=?, updated_at=? WHERE user_id=? AND (username!=? OR full_name!=?)",
-                (username or "", full_name or "User", now_iso, uid, username or "", full_name or "User")
-            )
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM users WHERE user_id=%s", (uid,))
+                exists = cur.fetchone()
+                if not exists:
+                    cur.execute(
+                        """INSERT INTO users
+                           (user_id, username, full_name, tier, daily_limit, credits,
+                            is_banned, expires_at, joined_at, lang, referred_by,
+                            referral_count, last_search_at, daily_nameid_limit, updated_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (uid, username or "", full_name or "User", "free", 5, 0, 0,
+                         None, now_iso, "en", None, 0, None,
+                         NAMEID_TIERS["free"]["daily_nameid"], now_iso)
+                    )
+            conn.commit()
+    except Exception as e:
+        log.error(f"ensure_user error: {e}")
 
-def is_admin(uid):   return uid in ADMIN_IDS
+def is_admin(uid):
+    return uid in ADMIN_IDS
+
 def is_banned(uid):
     u = get_user(uid)
-    if not u: return False
-    if u[6]: return True
-    # Check temporary freeze (stored in expires_at when tier is 'frozen')
-    with sqlite3.connect(DB_FILE) as conn:
-        row = conn.execute(
-            "SELECT frozen_until FROM users WHERE user_id=?", (uid,)
-        ).fetchone()
-    if row and row[0]:
+    if not u:
+        return False
+    # index 6 = is_banned, index 14 = frozen_until
+    if u[6]:
+        return True
+    frozen_until = u[14] if len(u) > 14 else None
+    if frozen_until:
         try:
-            if datetime.fromisoformat(row[0]) > datetime.utcnow():
+            if datetime.fromisoformat(str(frozen_until)) > datetime.utcnow():
                 return True
-            else:
-                # Freeze expired — clear it
-                with sqlite3.connect(DB_FILE) as conn:
-                    conn.execute("UPDATE users SET frozen_until=NULL WHERE user_id=?", (uid,))
         except Exception:
             pass
     return False
@@ -454,187 +381,236 @@ def get_tier(uid):
     return u[3] if u else "free"
 
 def _check_and_expire(uid: int):
-    """Downgrade user to free if subscription has expired."""
     u = get_user(uid)
-    if not u or not u[7]: return
+    if not u or not u[7]:
+        return
     try:
-        if datetime.fromisoformat(u[7]) < datetime.utcnow():
-            with sqlite3.connect(DB_FILE) as conn:
-                conn.execute(
-                    "UPDATE users SET tier='free', daily_limit=0, daily_nameid_limit=0, expires_at=NULL WHERE user_id=?",
-                    (uid,)
-                )
+        if datetime.fromisoformat(str(u[7])) < datetime.utcnow():
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE users SET tier='free', daily_limit=0, daily_nameid_limit=0, expires_at=NULL WHERE user_id=%s",
+                        (uid,)
+                    )
+                conn.commit()
             log.info(f"⏰ User {uid} subscription expired — downgraded to free.")
     except Exception:
         pass
 
 def can_search(uid):
-    if is_admin(uid): return True
+    if is_admin(uid):
+        return True
     _check_and_expire(uid)
     u = get_user(uid)
-    if not u: return False
-    if u[3] in ("premium", "vip"): return True
+    if not u:
+        return False
+    if u[3] in ("premium", "vip"):
+        return True
     return u[4] > 0 or u[5] > 0
 
 def deduct(uid):
-    with sqlite3.connect(DB_FILE) as conn:
-        u = conn.execute("SELECT daily_limit, credits FROM users WHERE user_id=?", (uid,)).fetchone()
-        if u:
-            if u[0] > 0:
-                conn.execute("UPDATE users SET daily_limit=daily_limit-1 WHERE user_id=?", (uid,))
-            elif u[1] > 0:
-                conn.execute("UPDATE users SET credits=credits-1 WHERE user_id=?", (uid,))
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT daily_limit, credits FROM users WHERE user_id=%s", (uid,))
+                u = cur.fetchone()
+                if u:
+                    if u[0] > 0:
+                        cur.execute("UPDATE users SET daily_limit=daily_limit-1 WHERE user_id=%s", (uid,))
+                    elif u[1] > 0:
+                        cur.execute("UPDATE users SET credits=credits-1 WHERE user_id=%s", (uid,))
+            conn.commit()
+    except Exception as e:
+        log.error(f"deduct error: {e}")
 
 def log_admin_op(admin_id: int, action: str, target: str, details: str = ""):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute(
-            "INSERT INTO admin_op_logs (admin_id, action, target, details, timestamp) VALUES (?,?,?,?,?)",
-            (admin_id, action, target, details, datetime.utcnow().isoformat())
-        )
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO admin_op_logs (admin_id, action, target, details, timestamp) VALUES (%s,%s,%s,%s,%s)",
+                    (admin_id, action, target, details, datetime.utcnow().isoformat())
+                )
+            conn.commit()
+    except Exception as e:
+        log.error(f"log_admin_op error: {e}")
 
 # ── Spam protection ───────────────────────────────────────
-SEARCH_COOLDOWN_SECS = 5   # min seconds between searches
+SEARCH_COOLDOWN_SECS = 5
 
 def is_search_spamming(uid: int) -> bool:
-    """Return True if user searched too recently — uses in-memory dict (fast)."""
-    if is_admin(uid): return False
+    if is_admin(uid):
+        return False
     with _rate_limit_lock:
         last = _last_search_time.get(uid)
-    if last is None: return False
+    if last is None:
+        return False
     return (time.monotonic() - last) < SEARCH_COOLDOWN_SECS
 
 def mark_search_time(uid: int):
     with _rate_limit_lock:
         _last_search_time[uid] = time.monotonic()
-    # Also persist to DB for cross-restart tracking
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("UPDATE users SET last_search_at=? WHERE user_id=?",
-                     (datetime.utcnow().isoformat(), uid))
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET last_search_at=%s WHERE user_id=%s",
+                            (datetime.utcnow().isoformat(), uid))
+            conn.commit()
+    except Exception as e:
+        log.error(f"mark_search_time error: {e}")
 
 # ── Name/ID quota helpers ─────────────────────────────────
 def can_search_nameid(uid: int) -> bool:
-    if is_admin(uid): return True
+    if is_admin(uid):
+        return True
     u = get_user(uid)
-    if not u: return False
+    if not u:
+        return False
     tier = u[3]
     nt = NAMEID_TIERS.get(tier, NAMEID_TIERS["free"])
-    if nt["daily_nameid"] >= 100000: return True   # VIP unlimited
-    # daily_nameid_limit stored in col index 13
+    if nt["daily_nameid"] >= 100000:
+        return True
     return u[13] > 0 if len(u) > 13 else False
 
 def deduct_nameid(uid: int):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute(
-            "UPDATE users SET daily_nameid_limit=MAX(0, daily_nameid_limit-1) WHERE user_id=?",
-            (uid,)
-        )
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET daily_nameid_limit=GREATEST(0, daily_nameid_limit-1) WHERE user_id=%s",
+                    (uid,)
+                )
+            conn.commit()
+    except Exception as e:
+        log.error(f"deduct_nameid error: {e}")
 
 def get_nameid_limit(uid: int) -> int:
-    """Max results for Name/ID search."""
-    if is_admin(uid): return 10_000_000
+    if is_admin(uid):
+        return 10_000_000
     u = get_user(uid)
     tier = u[3] if u else "free"
     return NAMEID_TIERS.get(tier, NAMEID_TIERS["free"])["max_nameid"]
 
 # ── Referral helpers ──────────────────────────────────────
 def process_referral(new_uid: int, ref_uid: int):
-    """Credit the referrer when a new user joins via their link."""
-    if new_uid == ref_uid: return
-    with sqlite3.connect(DB_FILE) as conn:
-        # Only credit once
-        already = conn.execute(
-            "SELECT referred_by FROM users WHERE user_id=?", (new_uid,)
-        ).fetchone()
-        if already and already[0]: return
-        conn.execute("UPDATE users SET referred_by=? WHERE user_id=?", (ref_uid, new_uid))
-        conn.execute(
-            "UPDATE users SET credits=credits+?, referral_count=referral_count+1 WHERE user_id=?",
-            (REFERRAL_CREDITS, ref_uid)
-        )
+    if new_uid == ref_uid:
+        return
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT referred_by FROM users WHERE user_id=%s", (new_uid,))
+                already = cur.fetchone()
+                if already and already[0]:
+                    return
+                cur.execute("UPDATE users SET referred_by=%s WHERE user_id=%s", (ref_uid, new_uid))
+                cur.execute(
+                    "UPDATE users SET credits=credits+%s, referral_count=referral_count+1 WHERE user_id=%s",
+                    (REFERRAL_CREDITS, ref_uid)
+                )
+            conn.commit()
+    except Exception as e:
+        log.error(f"process_referral error: {e}")
 
 def get_referral_stats(uid: int):
-    with sqlite3.connect(DB_FILE) as conn:
-        row = conn.execute(
-            "SELECT referral_count FROM users WHERE user_id=?", (uid,)
-        ).fetchone()
-    return row[0] if row else 0
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT referral_count FROM users WHERE user_id=%s", (uid,))
+                row = cur.fetchone()
+        return row[0] if row else 0
+    except Exception:
+        return 0
 
-# ── DB Backup ─────────────────────────────────────────────
+# ── DB Backup (file-based not applicable for PG, just log) ──
 def backup_db():
-    """Create a timestamped copy of the database."""
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    dest = os.path.join(BACKUP_DIR, f"scanner_backup_{ts}.db")
-    shutil.copy2(DB_FILE, dest)
-    # Keep only last 7 backups
-    backups = sorted(
-        [f for f in os.listdir(BACKUP_DIR) if f.endswith(".db")],
-        reverse=True
-    )
+    ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(BACKUP_DIR, f"pg_backup_note_{ts}.txt")
+    with open(dest, "w") as f:
+        f.write(f"PostgreSQL backup marker — {ts}\n")
+        f.write("Run: pg_dump -U postgres scanner > backup.sql\n")
+    backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith(".txt")], reverse=True)
     for old in backups[7:]:
         os.remove(os.path.join(BACKUP_DIR, old))
     return dest
 
 # ── Auto daily reset ──────────────────────────────────────
 def do_daily_reset():
-    with sqlite3.connect(DB_FILE) as conn:
-        for tn, td in TIERS.items():
-            conn.execute("UPDATE users SET daily_limit=? WHERE tier=?", (td["daily"], tn))
-        for tn, nd in NAMEID_TIERS.items():
-            conn.execute("UPDATE users SET daily_nameid_limit=? WHERE tier=?", (nd["daily_nameid"], tn))
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                for tn, td in TIERS.items():
+                    cur.execute("UPDATE users SET daily_limit=%s WHERE tier=%s", (td["daily"], tn))
+                for tn, nd in NAMEID_TIERS.items():
+                    cur.execute("UPDATE users SET daily_nameid_limit=%s WHERE tier=%s", (nd["daily_nameid"], tn))
+            conn.commit()
+    except Exception as e:
+        log.error(f"do_daily_reset error: {e}")
 
 def log_search(uid, keyword, category, count):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute(
-            "INSERT INTO search_logs VALUES (?,?,?,?,?)",
-            (uid, keyword, category, count, datetime.utcnow().isoformat())
-        )
-        # Save last search type for smart keyboard ordering
-        if category and not category.startswith("nameid_"):
-            conn.execute(
-                "UPDATE users SET last_search_type=? WHERE user_id=?",
-                (category, uid)
-            )
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO search_logs VALUES (%s,%s,%s,%s,%s)",
+                    (uid, keyword, category, count, datetime.utcnow().isoformat())
+                )
+                if category and not category.startswith("nameid_"):
+                    cur.execute(
+                        "UPDATE users SET last_search_type=%s WHERE user_id=%s",
+                        (category, uid)
+                    )
+            conn.commit()
+    except Exception as e:
+        log.error(f"log_search error: {e}")
 
 # ════════════════════════════════════════════
-#          RESULT COUNTER (NEW FEATURE)
+#          RESULT COUNTER
 # ════════════════════════════════════════════
 def escape_like(value: str) -> str:
-    """Escape SQLite LIKE special characters to prevent wildcard injection."""
     return value.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
 
 def count_matches_fast(keyword: str, stype: str) -> int:
-    """Quick COUNT query — no full scan, just estimates available rows."""
-    kw = f"%{escape_like(keyword)}%"
-    with sqlite3.connect(DB_FILE) as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM data_index WHERE line LIKE ? ESCAPE '\\'", (kw,)
-        ).fetchone()
-    return row[0] if row else 0
+    kw = f"%{keyword}%"
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM data_index WHERE line ILIKE %s",
+                    (kw,)
+                )
+                row = cur.fetchone()
+        return row[0] if row else 0
+    except Exception as e:
+        log.error(f"count_matches_fast error: {e}")
+        return 0
 
 def count_nameid_matches(query: str, qtype: str) -> int:
-    """Count Name/ID rows before download."""
-    with sqlite3.connect(DB_FILE) as conn:
-        if qtype == "national_id":
-            cleaned = re.sub(r"\s", "", query)
-            row = conn.execute(
-                "SELECT COUNT(*) FROM name_id_index WHERE national_id=?", (cleaned,)
-            ).fetchone()
-        elif qtype == "partial_id":
-            cleaned = re.sub(r"\s", "", query)
-            row = conn.execute(
-                "SELECT COUNT(*) FROM name_id_index WHERE national_id LIKE ? ESCAPE '\\'",
-                (f"%{escape_like(cleaned)}%",)
-            ).fetchone()
-        else:  # name
-            rows = conn.execute("SELECT full_name FROM name_id_index").fetchall()
-            norm_q = normalize_arabic(query)
-            query_words = norm_q.split()
-            count = sum(
-                1 for (name,) in rows
-                if all(w in normalize_arabic(name) for w in query_words)
-            )
-            return count
-    return row[0] if row else 0
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                if qtype == "national_id":
+                    cleaned = re.sub(r"\s", "", query)
+                    cur.execute(
+                        "SELECT COUNT(*) FROM name_id_index WHERE national_id=%s",
+                        (cleaned,)
+                    )
+                elif qtype == "partial_id":
+                    cleaned = re.sub(r"\s", "", query)
+                    cur.execute(
+                        "SELECT COUNT(*) FROM name_id_index WHERE national_id ILIKE %s",
+                        (f"%{cleaned}%",)
+                    )
+                else:  # name
+                    norm_q = normalize_arabic(query)
+                    cur.execute(
+                        "SELECT COUNT(*) FROM name_id_index WHERE full_name ILIKE %s",
+                        (f"%{norm_q}%",)
+                    )
+                row = cur.fetchone()
+        return row[0] if row else 0
+    except Exception as e:
+        log.error(f"count_nameid_matches error: {e}")
+        return 0
 
 # ════════════════════════════════════════════
 #     NAME / NATIONAL-ID DETECTION & SEARCH
@@ -659,18 +635,6 @@ def is_partial_national_id(value: str) -> bool:
     cleaned = re.sub(r"\s", "", value)
     return bool(re.fullmatch(r"\d{4,13}", cleaned))
 
-def sanitize_fts_query(words: list) -> str:
-    """Escape words for safe FTS5 MATCH query — strips special FTS operators."""
-    safe = []
-    FTS_SPECIAL = re.compile(r'["\*\(\)\:\^~\|&]')
-    FTS_OPERATORS = {"and", "or", "not", "near"}
-    for w in words:
-        w_clean = FTS_SPECIAL.sub("", w).strip()
-        if not w_clean or w_clean.lower() in FTS_OPERATORS:
-            continue
-        safe.append(f'"{w_clean}"')
-    return " OR ".join(safe) if safe else ""
-
 def search_by_name(query: str, limit: int = 50) -> list:
     norm_q = normalize_arabic(query)
     query_words = [w for w in norm_q.split() if len(w) >= 2]
@@ -678,72 +642,61 @@ def search_by_name(query: str, limit: int = 50) -> list:
         return []
     results = []
     seen = set()
-
-    # Try FTS5 first (fast), fallback to full scan if FTS table is empty
-    fts_query = sanitize_fts_query(query_words)
-    if fts_query:
-        try:
-            with sqlite3.connect(DB_FILE) as conn:
-                rows = conn.execute(
-                    "SELECT n.full_name, n.national_id FROM name_id_index n "
-                    "JOIN name_fts f ON n.id = f.rowid "
-                    "WHERE name_fts MATCH ? LIMIT ?",
-                    (fts_query, limit * 3)
-                ).fetchall()
-            for name, nat_id in rows:
-                norm_name = normalize_arabic(name)
-                if all(w in norm_name for w in query_words):
-                    key = (name.strip(), nat_id.strip())
-                    if key not in seen:
-                        seen.add(key)
-                        results.append({"name": name.strip(), "national_id": nat_id.strip()})
-                if len(results) >= limit:
-                    break
-            if results:
-                return results
-        except Exception:
-            pass
-
-    # Fallback: full scan with Arabic normalization
-    with sqlite3.connect(DB_FILE) as conn:
-        rows = conn.execute("SELECT full_name, national_id FROM name_id_index").fetchall()
-    for name, nat_id in rows:
-        norm_name = normalize_arabic(name)
-        if all(word in norm_name for word in query_words):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                # Use ILIKE for each word
+                conditions = " AND ".join(["full_name ILIKE %s"] * len(query_words))
+                params = [f"%{w}%" for w in query_words] + [limit * 5]
+                cur.execute(
+                    f"SELECT full_name, national_id FROM name_id_index WHERE {conditions} LIMIT %s",
+                    params
+                )
+                rows = cur.fetchall()
+        for name, nat_id in rows:
             key = (name.strip(), nat_id.strip())
             if key not in seen:
                 seen.add(key)
                 results.append({"name": name.strip(), "national_id": nat_id.strip()})
-        if len(results) >= limit:
-            break
+            if len(results) >= limit:
+                break
+    except Exception as e:
+        log.error(f"search_by_name error: {e}")
     return results
 
 def search_by_national_id(query: str, limit: int = 50) -> list:
     cleaned = re.sub(r"\s", "", query)
-    with sqlite3.connect(DB_FILE) as conn:
-        if is_national_id(query):
-            rows = conn.execute(
-                "SELECT full_name, national_id FROM name_id_index WHERE national_id=? LIMIT ?",
-                (cleaned, limit)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT full_name, national_id FROM name_id_index WHERE national_id LIKE ? LIMIT ?",
-                (f"%{cleaned}%", limit)
-            ).fetchall()
     results = []
     seen = set()
-    for name, nat_id in rows:
-        key = (name.strip(), nat_id.strip())
-        if key not in seen:
-            seen.add(key)
-            results.append({"name": name.strip(), "national_id": nat_id.strip()})
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                if is_national_id(query):
+                    cur.execute(
+                        "SELECT full_name, national_id FROM name_id_index WHERE national_id=%s LIMIT %s",
+                        (cleaned, limit)
+                    )
+                else:
+                    cur.execute(
+                        "SELECT full_name, national_id FROM name_id_index WHERE national_id ILIKE %s LIMIT %s",
+                        (f"%{cleaned}%", limit)
+                    )
+                rows = cur.fetchall()
+        for name, nat_id in rows:
+            key = (name.strip(), nat_id.strip())
+            if key not in seen:
+                seen.add(key)
+                results.append({"name": name.strip(), "national_id": nat_id.strip()})
+    except Exception as e:
+        log.error(f"search_by_national_id error: {e}")
     return results
 
 def detect_nameid_query_type(query: str) -> str:
     q = query.strip()
-    if is_national_id(q):      return "national_id"
-    if is_partial_national_id(q): return "partial_id"
+    if is_national_id(q):
+        return "national_id"
+    if is_partial_national_id(q):
+        return "partial_id"
     return "name"
 
 def parse_excel_for_name_id(path: str, original_name: str) -> list:
@@ -752,7 +705,6 @@ def parse_excel_for_name_id(path: str, original_name: str) -> list:
     except Exception:
         return []
 
-    # Arabic + English name column aliases
     NAME_ALIASES = {"اسم", "الاسم", "اسم كامل", "الاسم الكامل",
                     "name", "full name", "fullname", "full_name", "customer name"}
     ID_ALIASES   = {"رقم قومي", "الرقم القومي", "رقم هوية",
@@ -778,7 +730,6 @@ def parse_excel_for_name_id(path: str, original_name: str) -> list:
                 break
 
     if id_col is None:
-        # Fallback: scan all columns for one with mostly numeric 14-digit values
         for col in df.columns:
             sample  = df[col].dropna().astype(str).head(20)
             matches = sample.apply(lambda x: bool(re.fullmatch(r"\d{14}", re.sub(r"\D", "", x))))
@@ -824,7 +775,6 @@ def parse_line_fields(line: str) -> dict:
     line = line.strip()
     if not line:
         return {}
-    # Handle JSON object lines: {"email":"x","pass":"y","password":"z"}
     if line.startswith("{") and line.endswith("}"):
         try:
             obj = json.loads(line)
@@ -838,7 +788,8 @@ def parse_line_fields(line: str) -> dict:
                 for k, v in obj.items():
                     kl = k.lower().strip()
                     sv = str(v).strip() if v else ""
-                    if not sv or sv in ("null", "none", "nan"): continue
+                    if not sv or sv in ("null", "none", "nan"):
+                        continue
                     if kl in EMAIL_KEYS and "email" not in result:
                         result["email"] = sv
                     elif kl in PASS_KEYS and "password" not in result:
@@ -853,6 +804,7 @@ def parse_line_fields(line: str) -> dict:
                     return result
         except (json.JSONDecodeError, Exception):
             pass
+
     if "|" in line or ";" in line or "\t" in line:
         parts = [p.strip() for p in re.split(r"[|;\t]", line) if p.strip()]
     else:
@@ -863,6 +815,7 @@ def parse_line_fields(line: str) -> dict:
             parts    = [url_part] + [p.strip() for p in rest.split(":") if p.strip()]
         else:
             parts = [p.strip() for p in line.split(":") if p.strip()]
+
     result = {}
     for p in parts:
         if not p:
@@ -887,7 +840,7 @@ def parse_line_fields(line: str) -> dict:
 def line_matches_keyword(line: str, keyword: str) -> bool:
     return keyword.lower() in line.lower()
 
-def extract_for_search_type(line: str, stype: str, keyword: str) -> dict | None:
+def extract_for_search_type(line: str, stype: str, keyword: str):
     if not line_matches_keyword(line, keyword):
         return None
     fields = parse_line_fields(line)
@@ -896,38 +849,50 @@ def extract_for_search_type(line: str, stype: str, keyword: str) -> dict | None:
     kw_lower = keyword.lower()
     if stype == "domain":
         url = fields.get("url", "") or fields.get("domain", "")
-        if kw_lower not in url.lower(): return None
+        if kw_lower not in url.lower():
+            return None
     elif stype == "url":
         url = fields.get("url", "")
-        if kw_lower not in url.lower(): return None
+        if kw_lower not in url.lower():
+            return None
     elif stype == "email":
         email = fields.get("email", "")
-        if kw_lower not in email.lower(): return None
+        if kw_lower not in email.lower():
+            return None
     elif stype == "phone":
         phone = fields.get("phone", "")
-        if kw_lower not in phone.lower(): return None
+        if kw_lower not in phone.lower():
+            return None
     elif stype in ("username", "login"):
         uname = fields.get("username", "") or fields.get("email", "")
-        if kw_lower not in uname.lower(): return None
+        if kw_lower not in uname.lower():
+            return None
     elif stype == "password":
         pwd = fields.get("password", "")
-        if kw_lower not in pwd.lower(): return None
+        if kw_lower not in pwd.lower():
+            return None
     return fields
 
 def smart_search(keyword: str, stype: str, limit: int) -> list:
-    kw = f"%{escape_like(keyword)}%"
-    with sqlite3.connect(DB_FILE) as conn:
-        rows = conn.execute(
-            "SELECT line FROM data_index WHERE line LIKE ? ESCAPE '\\' LIMIT ?",
-            (kw, limit * 10)
-        ).fetchall()
+    kw = f"%{keyword}%"
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT line FROM data_index WHERE line ILIKE %s LIMIT %s",
+                    (kw, limit * 10)
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        log.error(f"smart_search query error: {e}")
+        return []
+
     results = []
     seen = set()
     for (line,) in rows:
         fields = extract_for_search_type(line, stype, keyword)
         if fields is None:
             continue
-        # Stronger dedup: normalize all meaningful fields into a fingerprint
         fp_parts = []
         for field in ("url", "domain", "email", "username", "phone", "password", "login"):
             val = fields.get(field, "").strip().lower()
@@ -948,7 +913,6 @@ def smart_search(keyword: str, stype: str, limit: int) -> list:
 #         BUILD CLEAN RESULT FILE
 # ════════════════════════════════════════════
 async def safe_send_document(send_fn, path: str, filename: str, caption: str, reply_markup=None):
-    """Send document with caption — truncates caption if too long, retries on network error."""
     MAX_CAPTION = 1024
     if len(caption) > MAX_CAPTION:
         caption = caption[:MAX_CAPTION - 10] + "\n_..._"
@@ -962,9 +926,8 @@ async def safe_send_document(send_fn, path: str, filename: str, caption: str, re
                     caption=caption, parse_mode="Markdown",
                     reply_markup=reply_markup
                 )
-            return  # success
+            return
         except BadRequest:
-            # Strip Markdown and retry once
             plain = re.sub(r"[*_`\[\]]", "", caption)
             try:
                 with open(path, "rb") as f:
@@ -983,25 +946,16 @@ async def safe_send_document(send_fn, path: str, filename: str, caption: str, re
         except TelegramError as e:
             last_err = e
             if attempt < 2:
-                await asyncio.sleep(2 ** attempt)  # exponential backoff: 1s, 2s
+                await asyncio.sleep(2 ** attempt)
         except Exception as e:
             last_err = e
             break
 
-    # All retries exhausted — notify user
-    try:
-        await send_fn.__self__.send_message(
-            chat_id=None,
-            text=f"❌ Failed to send file after 3 attempts: `{mesc(str(last_err)[:100])}`",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        log.error(f"safe_send_document failed: {last_err}")
+    log.error(f"safe_send_document failed: {last_err}")
 
 def build_result_txt(keyword: str, results: list, stype: str) -> str:
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    # Truncate if too many results to prevent huge files
     truncated = False
     if len(results) > MAX_RESULT_LINES:
         results = results[:MAX_RESULT_LINES]
@@ -1020,8 +974,10 @@ def build_result_txt(keyword: str, results: list, stype: str) -> str:
         pwd  = r.get("password", "")
         ph   = r.get("phone", "")
         if em and pwd:
-            if url: url_combo.append((url, em, pwd))
-            else:   email_pass.append((em, pwd))
+            if url:
+                url_combo.append((url, em, pwd))
+            else:
+                email_pass.append((em, pwd))
         elif url and (em or user) and pwd:
             url_combo.append((url, em or user, pwd))
         elif (em or user) and pwd:
@@ -1052,11 +1008,13 @@ def build_result_txt(keyword: str, results: list, stype: str) -> str:
         lines.insert(3, f"  ⚠️  Results exceeded {MAX_RESULT_LINES:,} — showing first {MAX_RESULT_LINES:,} only")
     if email_pass:
         lines += [f"{'─'*55}", f"  📧 EMAIL:PASS — {len(email_pass)} results", f"{'─'*55}"]
-        for em, pwd in email_pass: lines.append(f"{em}:{pwd}")
+        for em, pwd in email_pass:
+            lines.append(f"{em}:{pwd}")
         lines.append("")
     if url_combo:
         lines += [f"{'─'*55}", f"  🌐 URL | USER:PASS — {len(url_combo)} results", f"{'─'*55}"]
-        for url, user, pwd in url_combo: lines.append(f"{url}|{user}:{pwd}")
+        for url, user, pwd in url_combo:
+            lines.append(f"{url}|{user}:{pwd}")
         lines.append("")
     if login_combo:
         lines += [f"{'─'*55}", f"  👤 USER:PASS — {len(login_combo)} results", f"{'─'*55}"]
@@ -1099,17 +1057,17 @@ def build_nameid_result_txt(keyword: str, results: list, qtype: str) -> str:
 #               FILE PARSING
 # ════════════════════════════════════════════
 def _open_text_file(path: str):
-    """Open a text file trying multiple encodings: UTF-8 → CP1256 (Arabic) → Latin-1."""
     for enc in ("utf-8", "cp1256", "latin-1"):
         try:
             f = open(path, "r", encoding=enc, errors="strict")
-            f.read(512)   # probe first 512 bytes
+            f.read(512)
             f.seek(0)
             return f, enc
         except (UnicodeDecodeError, Exception):
-            try: f.close()
-            except: pass
-    # Last resort: utf-8 with replacement chars
+            try:
+                f.close()
+            except Exception:
+                pass
     return open(path, "r", encoding="utf-8", errors="replace"), "utf-8(replace)"
 
 def parse_file(path: str, original_name: str) -> list:
@@ -1149,12 +1107,14 @@ def parse_file(path: str, original_name: str) -> list:
             df = pd.read_csv(path, dtype=str, on_bad_lines="skip", encoding="latin-1", errors="replace")
         for _, row in df.iterrows():
             vals = [str(v).strip() for v in row if pd.notna(v) and str(v).strip()]
-            if vals: add_line(":".join(vals))
+            if vals:
+                add_line(":".join(vals))
     elif ext in ("xlsx", "xls"):
         df = pd.read_excel(path, dtype=str)
         for _, row in df.iterrows():
             vals = [str(v).strip() for v in row if pd.notna(v) and str(v).strip()]
-            if vals: add_line(":".join(vals))
+            if vals:
+                add_line(":".join(vals))
     elif ext == "json":
         f, enc = _open_text_file(path)
         with f:
@@ -1162,22 +1122,28 @@ def parse_file(path: str, original_name: str) -> list:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            # Try JSONL (one JSON object per line)
             data = []
             for ln in raw.splitlines():
                 ln = ln.strip()
                 if ln:
-                    try: data.append(json.loads(ln))
-                    except: pass
+                    try:
+                        data.append(json.loads(ln))
+                    except Exception:
+                        pass
+
         def flatten(obj):
             if isinstance(obj, dict):
-                # Emit the whole record as a structured line
                 yield json.dumps(obj, ensure_ascii=False)
-                for v in obj.values(): yield from flatten(v)
+                for v in obj.values():
+                    yield from flatten(v)
             elif isinstance(obj, list):
-                for item in obj: yield from flatten(item)
-            elif isinstance(obj, str): yield obj
-        for v in flatten(data): add_line(v)
+                for item in obj:
+                    yield from flatten(item)
+            elif isinstance(obj, str):
+                yield obj
+
+        for v in flatten(data):
+            add_line(v)
 
     return results
 
@@ -1185,9 +1151,9 @@ def parse_file(path: str, original_name: str) -> list:
 #                  KEYBOARDS
 # ════════════════════════════════════════════
 def user_main_kb(uid: int = 0):
-    lang = get_lang(uid) if uid else "en"
+    lang  = get_lang(uid) if uid else "en"
     is_ar = lang == "ar"
-    st = STRINGS.get(lang, STRINGS["en"])
+    st    = STRINGS.get(lang, STRINGS["en"])
     rows = [
         [InlineKeyboardButton(st["btn_search"],    callback_data="go_search")],
         [InlineKeyboardButton(st["btn_nameid"],    callback_data="go_nameid")],
@@ -1204,24 +1170,27 @@ def user_main_kb(uid: int = 0):
         [InlineKeyboardButton("🔗 " + ("دعوة صديق" if is_ar else "Referral Link"), callback_data="my_referral")],
         [InlineKeyboardButton("🆔 " + ("معرفي" if is_ar else "My ID"), callback_data="my_id")],
     ]
-    # Add Renew button if subscription is expired or expiring within 3 days
     if uid:
         u = get_user(uid)
         if u:
-            tier_v   = u[3]
-            exp_at   = u[7]
-            if tier_v == "free" or (exp_at and (datetime.fromisoformat(exp_at) - datetime.utcnow()).days <= 3):
+            tier_v = u[3]
+            exp_at = u[7]
+            if tier_v == "free" or (exp_at and (datetime.fromisoformat(str(exp_at)) - datetime.utcnow()).days <= 3):
                 renew_label = "🔄 تجديد الاشتراك" if is_ar else "🔄 Renew Subscription"
                 rows.insert(3, [InlineKeyboardButton(renew_label, callback_data="user_subscribe")])
     return InlineKeyboardMarkup(rows)
 
 def search_type_kb(uid: int = 0):
-    # Fetch last search type for smart ordering
     last_type = None
     if uid:
-        with sqlite3.connect(DB_FILE) as conn:
-            row = conn.execute("SELECT last_search_type FROM users WHERE user_id=?", (uid,)).fetchone()
-            last_type = row[0] if row and row[0] else None
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT last_search_type FROM users WHERE user_id=%s", (uid,))
+                    row = cur.fetchone()
+                    last_type = row[0] if row and row[0] else None
+        except Exception:
+            pass
 
     type_buttons = {
         "url":      InlineKeyboardButton("🌐 URL",      callback_data="st_url"),
@@ -1264,10 +1233,8 @@ def new_search_kb():
     ])
 
 def result_share_kb():
-    """Keyboard shown after search result is sent — includes forward hint."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 New Search",        callback_data="go_search")],
-        [InlineKeyboardButton("💾 Save to Saved Msgs", url="tg://msg?text=forward")],
         [InlineKeyboardButton("🏠 Main Menu",          callback_data="user_home")],
     ])
 
@@ -1298,9 +1265,7 @@ def admin_main_kb():
             InlineKeyboardButton("🔒 Ban User",     callback_data="adm_ban"),
             InlineKeyboardButton("✅ Unban User",   callback_data="adm_unban"),
         ],
-        [
-            InlineKeyboardButton("🧊 Freeze User",  callback_data="adm_freeze"),
-        ],
+        [InlineKeyboardButton("🧊 Freeze User",     callback_data="adm_freeze")],
         [
             InlineKeyboardButton("📜 Search Logs",  callback_data="adm_logs"),
             InlineKeyboardButton("🗂️ Files",         callback_data="adm_filelist"),
@@ -1313,8 +1278,10 @@ def admin_main_kb():
         [InlineKeyboardButton("✉️ Message User",      callback_data="adm_msg_user")],
         [InlineKeyboardButton("📅 Set Expiry",        callback_data="adm_set_expiry")],
         [InlineKeyboardButton("🔎 Filter Logs",       callback_data="adm_filter_logs")],
-        [InlineKeyboardButton("💾 Backup DB",         callback_data="adm_backup"),
-         InlineKeyboardButton("📤 Export Users CSV",  callback_data="adm_export_csv")],
+        [
+            InlineKeyboardButton("💾 Backup DB",         callback_data="adm_backup"),
+            InlineKeyboardButton("📤 Export Users CSV",  callback_data="adm_export_csv"),
+        ],
         [InlineKeyboardButton("📋 طلبات الاشتراك",   callback_data="adm_sub_requests")],
         [InlineKeyboardButton("📜 سجل عمليات الأدمن", callback_data="adm_op_logs")],
         [InlineKeyboardButton("⚡ Bot Status",        callback_data="adm_bot_status")],
@@ -1330,20 +1297,18 @@ def back_admin_kb():
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    # MAINTENANCE check — admins always bypass
     if MAINTENANCE_MODE and not is_admin(user.id):
-        await update.message.reply_text(MAINTENANCE_MSG, parse_mode="Markdown"); return
+        await update.message.reply_text(MAINTENANCE_MSG, parse_mode="Markdown")
+        return
 
     is_new = get_user(user.id) is None
 
-    # WHITELIST check
     if WHITELIST_MODE and user.id not in WHITELIST_IDS and not is_admin(user.id):
         await update.message.reply_text("🔒 This bot is in private mode. Access restricted.")
         return
 
     ensure_user(user.id, user.username or "", user.first_name or "")
 
-    # Notify admin of new user (non-blocking)
     if is_new:
         for admin_id in ADMIN_IDS:
             try:
@@ -1360,6 +1325,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 pass
+
     if is_new and context.args:
         try:
             ref_uid = int(context.args[0])
@@ -1368,11 +1334,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     if is_banned(user.id):
-        await update.message.reply_text("🚫 *Your account has been banned.*\n\nIf you believe this is a mistake, please contact the admin.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "🚫 *Your account has been banned.*\n\nIf you believe this is a mistake, please contact the admin.",
+            parse_mode="Markdown"
+        )
         return
+
     if is_admin(user.id):
         await show_admin_home(update, context, send=True)
         return
+
     if is_new:
         name = esc(user.first_name or "there")
         await update.message.reply_text(
@@ -1391,17 +1362,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
         return
+
     await show_user_home(update, context, send=True)
 
 def esc(text: str) -> str:
-    """Escape special HTML characters to prevent parse errors."""
     return (str(text)
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;"))
 
 def mesc(text: str) -> str:
-    """Escape user input for safe embedding inside Markdown messages (outside backticks)."""
     return (str(text)
             .replace("\\", "\\\\")
             .replace("*", "\\*")
@@ -1412,40 +1382,44 @@ def mesc(text: str) -> str:
 async def show_user_home(update, context, send=False, query=None):
     uid = query.from_user.id if query else update.effective_user.id
     u   = get_user(uid)
-    tier_key   = u[3] if u else "free"
-    daily_left = u[4] if u else 5
-    credits    = u[5] if u else 0
-    full_name  = u[2] if u else "User"
-    expires_at = u[7] if u else None
+    tier_key   = u[3]  if u else "free"
+    daily_left = u[4]  if u else 5
+    credits    = u[5]  if u else 0
+    full_name  = u[2]  if u else "User"
+    expires_at = u[7]  if u else None
     t          = TIERS.get(tier_key, TIERS["free"])
 
-    with sqlite3.connect(DB_FILE) as conn:
-        nameid_count  = conn.execute("SELECT COUNT(*) FROM name_id_index").fetchone()[0]
-        db_count      = conn.execute("SELECT COUNT(*) FROM data_index").fetchone()[0]
-        total_searches= conn.execute("SELECT COUNT(*) FROM search_logs WHERE user_id=?", (uid,)).fetchone()[0]
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM name_id_index")
+                nameid_count = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM data_index")
+                db_count = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM search_logs WHERE user_id=%s", (uid,))
+                total_searches = cur.fetchone()[0]
+    except Exception:
+        nameid_count = total_searches = db_count = 0
 
-    lang = get_lang(uid)
-    st   = STRINGS.get(lang, STRINGS["en"])
+    lang  = get_lang(uid)
+    st    = STRINGS.get(lang, STRINGS["en"])
     is_ar = lang == "ar"
     nameid_left = u[13] if u and len(u) > 13 else 0
 
-    # Renewal time
-    now_utc = datetime.utcnow()
+    now_utc      = datetime.utcnow()
     next_midnight = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    hrs_left = int((next_midnight - now_utc).total_seconds() // 3600)
+    hrs_left  = int((next_midnight - now_utc).total_seconds() // 3600)
     mins_left = int(((next_midnight - now_utc).total_seconds() % 3600) // 60)
     renew_str = f"{hrs_left}h {mins_left}m" if not is_ar else f"{hrs_left}س {mins_left}د"
 
-    # Expiry line
+    exp_line = ""
     if expires_at:
         try:
-            exp_dt = datetime.fromisoformat(expires_at)
+            exp_dt   = datetime.fromisoformat(str(expires_at))
             days_rem = (exp_dt - now_utc).days
-            exp_line = f"\n📅 {'ينتهي في' if is_ar else 'Expires'}: <code>{expires_at[:10]}</code> ({days_rem}d)"
+            exp_line = f"\n📅 {'ينتهي في' if is_ar else 'Expires'}: <code>{str(expires_at)[:10]}</code> ({days_rem}d)"
         except Exception:
-            exp_line = ""
-    else:
-        exp_line = ""
+            pass
 
     text = (
         f"🤖 <b>DATA SCANNER YUTO BOT</b>\n"
@@ -1468,13 +1442,25 @@ async def show_user_home(update, context, send=False, query=None):
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=user_main_kb(uid))
 
 async def show_admin_home(update, context, send=False, query=None):
-    with sqlite3.connect(DB_FILE) as conn:
-        total_records  = conn.execute("SELECT COUNT(*) FROM data_index").fetchone()[0]
-        total_nameid   = conn.execute("SELECT COUNT(*) FROM name_id_index").fetchone()[0]
-        total_users    = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        total_files    = conn.execute("SELECT COUNT(*) FROM uploaded_files").fetchone()[0]
-        total_searches = conn.execute("SELECT COUNT(*) FROM search_logs").fetchone()[0]
-        banned_count   = conn.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM data_index")
+                total_records = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM name_id_index")
+                total_nameid = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM users")
+                total_users = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM uploaded_files")
+                total_files = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM search_logs")
+                total_searches = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM users WHERE is_banned=1")
+                banned_count = cur.fetchone()[0]
+    except Exception as e:
+        log.error(f"show_admin_home error: {e}")
+        total_records = total_nameid = total_users = total_files = total_searches = banned_count = 0
+
     text = (
         f"⚙️ *ADMIN CONTROL PANEL*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1494,8 +1480,8 @@ async def show_admin_home(update, context, send=False, query=None):
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_main_kb())
 
 # ── Callback rate limiting ────────────────────────────────
-_last_callback: dict[int, float] = {}
-_CALLBACK_COOLDOWN = 1.0  # seconds between callbacks per user
+_last_callback: dict = {}
+_CALLBACK_COOLDOWN = 1.0
 
 # ════════════════════════════════════════════
 #            CALLBACK QUERY ROUTER
@@ -1503,9 +1489,8 @@ _CALLBACK_COOLDOWN = 1.0  # seconds between callbacks per user
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query
     uid  = q.from_user.id
-    data = _cb_get(q.data)  # resolve hashed callback data if needed
+    data = _cb_get(q.data)
 
-    # Rate limit callbacks
     now_t = time.monotonic()
     with _rate_limit_lock:
         last_cb = _last_callback.get(uid, 0)
@@ -1518,11 +1503,15 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(uid, q.from_user.username or "", q.from_user.first_name or "")
 
     if is_banned(uid) and not is_admin(uid):
-        await q.edit_message_text("🚫 *Your account has been banned.*\n\nContact the admin for support.", parse_mode="Markdown")
+        await q.edit_message_text(
+            "🚫 *Your account has been banned.*\n\nContact the admin for support.",
+            parse_mode="Markdown"
+        )
         return
 
     if data == "user_home":
-        await show_user_home(update, context, query=q); return
+        await show_user_home(update, context, query=q)
+        return
 
     if data == "set_language":
         await q.edit_message_text(
@@ -1533,19 +1522,27 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("🇸🇦 العربية", callback_data="lang_ar")],
                 [InlineKeyboardButton("🔙 Back / رجوع", callback_data="user_home")],
             ])
-        ); return
+        )
+        return
 
     if data in ("lang_en", "lang_ar"):
         chosen = data.split("_")[1]
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute("UPDATE users SET lang=? WHERE user_id=?", (chosen, uid))
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE users SET lang=%s WHERE user_id=%s", (chosen, uid))
+                conn.commit()
+        except Exception as e:
+            log.error(f"lang update error: {e}")
         confirm = STRINGS[chosen]["lang_set"]
-        await q.edit_message_text(confirm, parse_mode="Markdown",
+        await q.edit_message_text(
+            confirm, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
                 "🔙 Main Menu" if chosen == "en" else "🔙 القائمة الرئيسية",
                 callback_data="user_home"
             )]])
-        ); return
+        )
+        return
 
     if data == "user_subscribe":
         st = STRINGS.get(get_lang(uid), STRINGS["en"])
@@ -1558,12 +1555,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             f"{st['sub_req_title']}\n\n{st['sub_req_prompt']}",
             parse_mode="Markdown", reply_markup=tiers_kb
-        ); return
+        )
+        return
 
     if data.startswith("sub_req_"):
         tier = data.replace("sub_req_", "")
         if tier not in TIERS or tier == "free":
-            await q.answer("❌ Invalid tier", show_alert=True); return
+            await q.answer("❌ Invalid tier", show_alert=True)
+            return
         user_obj = q.from_user
 
         async def reply_fn(text, parse_mode=None):
@@ -1572,29 +1571,30 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _do_subscribe_request(
             uid, user_obj.username or "", user_obj.first_name or "User",
             tier, context, reply_fn
-        ); return
+        )
+        return
 
     if data == "adm_home":
-        if not is_admin(uid): return
-        await show_admin_home(update, context, query=q); return
+        if not is_admin(uid):
+            return
+        await show_admin_home(update, context, query=q)
+        return
 
-    # ── my_account ──────────────────────────────────
     if data == "my_account":
         u = get_user(uid)
         if not u:
             await q.edit_message_text("❌ Account not found. Send /start first.", reply_markup=back_user_kb(uid))
             return
-        lang = get_lang(uid)
+        lang  = get_lang(uid)
         is_ar = lang == "ar"
         tier_d   = TIERS.get(u[3], TIERS["free"])
         username = esc(u[1] or "N/A")
         fullname = esc(u[2] or "User")
         daily    = u[4]
         credits  = u[5]
-        exp      = esc(u[7] or ("لا يوجد انتهاء" if is_ar else "No expiry"))
+        exp      = esc(str(u[7]) if u[7] else ("لا يوجد انتهاء" if is_ar else "No expiry"))
         tier_name = u[3]
 
-        # Build daily limit progress bar
         max_daily = TIERS.get(tier_name, TIERS["free"])["daily"]
         used      = max(0, max_daily - daily) if max_daily > 0 else 0
         if max_daily > 0 and max_daily < 100_000:
@@ -1605,7 +1605,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             daily_bar = f"`{daily}` {'متبقي' if is_ar else 'remaining'}"
 
-        # Name/ID usage
         max_ni  = NAMEID_TIERS.get(tier_name, NAMEID_TIERS["free"])["daily_nameid"]
         ni_left = u[13] if len(u) > 13 else 0
         ni_used = max(0, max_ni - ni_left) if max_ni > 0 else 0
@@ -1652,26 +1651,32 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "go_nameid":
         if not can_search_nameid(uid):
             is_ar = get_lang(uid) == "ar"
-            msg_no = "❌ *انتهت بحوث Name/ID لليوم.*\n\nقم بترقية باقتك للحصول على المزيد." if is_ar else "❌ *Name/ID searches used up for today.*\n\nUpgrade your plan for more."
+            msg_no = (
+                "❌ *انتهت بحوث Name/ID لليوم.*\n\nقم بترقية باقتك للحصول على المزيد."
+                if is_ar else
+                "❌ *Name/ID searches used up for today.*\n\nUpgrade your plan for more."
+            )
             await q.edit_message_text(
-                msg_no,
-                parse_mode="Markdown",
+                msg_no, parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("💳 View Plans", callback_data="show_plans")],
                     [InlineKeyboardButton("🔙 Back",       callback_data="user_home")],
                 ])
-            ); return
+            )
+            return
         await q.edit_message_text(
             "🪪 *Name / National ID Search*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "اختار نوع البحث:",
             parse_mode="Markdown",
             reply_markup=nameid_type_kb()
-        ); return
+        )
+        return
 
     if data in ("ni_name", "ni_national_id"):
         if not can_search(uid):
-            await q.edit_message_text("❌ No searches remaining.", reply_markup=back_user_kb(uid)); return
+            await q.edit_message_text("❌ No searches remaining.", reply_markup=back_user_kb(uid))
+            return
         context.user_data["search_type"] = data
         if data == "ni_name":
             prompt = "👤 *بحث بالاسم*\n\n✏️ ابعت الاسم أو جزء منه:\n_مثال: عبد الفتاح السيسي_"
@@ -1680,13 +1685,15 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             prompt, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="go_nameid")]])
-        ); return
+        )
+        return
 
     if data == "go_search":
         await q.edit_message_text(
             "🔍 *Choose Search Type*\n\nSelect the type of data you want to search for:",
             parse_mode="Markdown", reply_markup=search_type_kb(uid)
-        ); return
+        )
+        return
 
     if data.startswith("st_"):
         stype = data[3:]
@@ -1700,7 +1707,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("💳 View Plans", callback_data="show_plans")],
                         [InlineKeyboardButton("🔙 Back",       callback_data="go_search")],
                     ])
-                ); return
+                )
+                return
         if not can_search(uid):
             await q.edit_message_text(
                 "❌ *No searches remaining.*\n\nUpgrade your plan or buy credits.",
@@ -1709,19 +1717,24 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("💳 View Plans", callback_data="show_plans")],
                     [InlineKeyboardButton("🔙 Back",       callback_data="user_home")],
                 ])
-            ); return
+            )
+            return
         context.user_data["search_type"] = stype
         icons = {"url":"🌐","domain":"🌍","login":"👤","username":"📝",
                  "email":"📧","phone":"📱","password":"🔑","all":"🔎"}
-        icon  = icons.get(stype, "🔍")
+        icon = icons.get(stype, "🔍")
 
-        # Fetch last 5 keywords for this user
-        with sqlite3.connect(DB_FILE) as conn:
-            recent = conn.execute(
-                "SELECT DISTINCT keyword FROM search_logs WHERE user_id=? "
-                "ORDER BY timestamp DESC LIMIT 5",
-                (uid,)
-            ).fetchall()
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT DISTINCT keyword FROM search_logs WHERE user_id=%s "
+                        "ORDER BY timestamp DESC LIMIT 5",
+                        (uid,)
+                    )
+                    recent = cur.fetchall()
+        except Exception:
+            recent = []
 
         kb_rows = []
         if recent:
@@ -1739,7 +1752,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏱️ Search runs for up to *3 minutes* to find best results.{hint}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb_rows)
-        ); return
+        )
+        return
 
     if data == "show_plans":
         is_ar = get_lang(uid) == "ar"
@@ -1780,16 +1794,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 طلب اشتراك / Subscribe" if is_ar else "📋 Subscribe Request", callback_data="user_subscribe")],
             [InlineKeyboardButton("🔙 القائمة / Menu", callback_data="user_home")],
-        ])); return
+        ]))
+        return
 
     if data == "show_help":
         is_ar = get_lang(uid) == "ar"
-        u = get_user(uid)
+        u     = get_user(uid)
         tier_key = u[3] if u else "free"
-        t = TIERS.get(tier_key, TIERS["free"])
+        t  = TIERS.get(tier_key, TIERS["free"])
         nt = NAMEID_TIERS.get(tier_key, NAMEID_TIERS["free"])
-        daily_left   = u[4] if u else 0
-        nameid_left  = u[13] if u and len(u) > 13 else 0
+        daily_left  = u[4]  if u else 0
+        nameid_left = u[13] if u and len(u) > 13 else 0
         plan_info = (
             f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📦 {'باقتك الحالية' if is_ar else 'Your Current Plan'}: *{esc(t['label'])}*\n"
@@ -1832,36 +1847,32 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚠️ *Note:* National ID = 14 digits (not a phone number)"
                 f"{plan_info}"
             )
-        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=back_user_kb(uid)); return
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=back_user_kb(uid))
+        return
 
-    # ── NEW: confirm download callbacks ──────────────────
     if data.startswith("confirm_search:"):
-        # format: confirm_search:STYPE:KEYWORD
         parts_cb = data.split(":", 2)
         if len(parts_cb) < 3:
-            await q.answer("❌ Invalid callback.", show_alert=True); return
+            await q.answer("❌ Invalid callback.", show_alert=True)
+            return
         _, stype, keyword = parts_cb
-        context.user_data["search_type"]    = stype
-        context.user_data["confirmed_kw"]   = keyword
+        context.user_data["search_type"]  = stype
+        context.user_data["confirmed_kw"] = keyword
         await q.edit_message_text(
             f"⏳ Starting scan for `{mesc(keyword)}`...",
             parse_mode="Markdown"
         )
-        # Re-trigger search as if user typed the keyword
-        fake_update = update
-        await do_search(fake_update, context, keyword, stype, reply_to=q.message)
+        await do_search(update, context, keyword, stype, reply_to=q.message)
         return
 
     if data.startswith("confirm_nameid:"):
-        # format: confirm_nameid:STYPE:KEYWORD
         parts_cb = data.split(":", 2)
         if len(parts_cb) < 3:
-            await q.answer("❌ Invalid callback.", show_alert=True); return
+            await q.answer("❌ Invalid callback.", show_alert=True)
+            return
         _, stype, keyword = parts_cb
         context.user_data["search_type"] = stype
-        await q.edit_message_text(
-            f"⏳ جاري تحضير الملف...", parse_mode="Markdown"
-        )
+        await q.edit_message_text("⏳ جاري تحضير الملف...", parse_mode="Markdown")
         await do_nameid_search(update, context, keyword, stype, reply_to=q.message)
         return
 
@@ -1870,23 +1881,38 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ════ ADMIN CALLBACKS ════
-    if not is_admin(uid): return
+    if not is_admin(uid):
+        return
 
     if data == "adm_stats":
-        with sqlite3.connect(DB_FILE) as conn:
-            tr = conn.execute("SELECT COUNT(*) FROM data_index").fetchone()[0]
-            tn = conn.execute("SELECT COUNT(*) FROM name_id_index").fetchone()[0]
-            tu = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-            tb = conn.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
-            ts = conn.execute("SELECT COUNT(*) FROM search_logs").fetchone()[0]
-            tf = conn.execute("SELECT COUNT(*) FROM uploaded_files").fetchone()[0]
-            tc = conn.execute("SELECT tier, COUNT(*) FROM users GROUP BY tier").fetchall()
-            # Upload stats
-            up_stats = conn.execute(
-                "SELECT COALESCE(SUM(size_bytes),0), COALESCE(MAX(size_bytes),0), "
-                "COALESCE(AVG(records),0), COALESCE(MAX(records),0) FROM uploaded_files"
-            ).fetchone()
-            total_sz, max_sz, avg_recs, max_recs = up_stats
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM data_index")
+                    tr = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM name_id_index")
+                    tn = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM users")
+                    tu = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM users WHERE is_banned=1")
+                    tb = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM search_logs")
+                    ts = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM uploaded_files")
+                    tf = cur.fetchone()[0]
+                    cur.execute("SELECT tier, COUNT(*) FROM users GROUP BY tier")
+                    tc = cur.fetchall()
+                    cur.execute(
+                        "SELECT COALESCE(SUM(size_bytes),0), COALESCE(MAX(size_bytes),0), "
+                        "COALESCE(AVG(records),0), COALESCE(MAX(records),0) FROM uploaded_files"
+                    )
+                    up_stats = cur.fetchone()
+        except Exception as e:
+            log.error(f"adm_stats error: {e}")
+            await q.edit_message_text("❌ Stats error.", reply_markup=back_admin_kb())
+            return
+
+        total_sz, max_sz, avg_recs, max_recs = up_stats
         tier_lines = "\n".join([f"  {t}: `{c}`" for t, c in tc])
         await q.edit_message_text(
             f"📊 *Bot Statistics*\n━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1895,20 +1921,22 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📁 Files: `{tf}` | 🔍 Searches: `{ts:,}`\n\n"
             f"📦 *Tier Breakdown:*\n{tier_lines}\n\n"
             f"📂 *Upload Stats:*\n"
-            f"  💾 Total size: `{round(total_sz/1024/1024, 1)} MB`\n"
-            f"  📄 Largest file: `{round(max_sz/1024/1024, 2)} MB`\n"
-            f"  📊 Avg records/file: `{int(avg_recs):,}`\n"
-            f"  🏆 Max records: `{int(max_recs):,}`",
+            f"  💾 Total size: `{round((total_sz or 0)/1024/1024, 1)} MB`\n"
+            f"  📄 Largest file: `{round((max_sz or 0)/1024/1024, 2)} MB`\n"
+            f"  📊 Avg records/file: `{int(avg_recs or 0):,}`\n"
+            f"  🏆 Max records: `{int(max_recs or 0):,}`",
             parse_mode="Markdown", reply_markup=back_admin_kb()
-        ); return
+        )
+        return
 
     if data == "adm_users" or data.startswith("adm_users_p") or data.startswith("adm_users_f"):
-        # Parse page and filter
         page = 0
         tier_filter = None
         if data.startswith("adm_users_p"):
-            try: page = int(data.split("_p")[1].split("_f")[0])
-            except: page = 0
+            try:
+                page = int(data.split("_p")[1].split("_f")[0])
+            except Exception:
+                page = 0
         if "_f" in data:
             tier_filter = data.split("_f")[-1] or None
         elif data.startswith("adm_users_f"):
@@ -1916,15 +1944,33 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         per_page = 10
         offset   = page * per_page
-        where    = "WHERE tier=?" if tier_filter else ""
-        params_c = (tier_filter,) if tier_filter else ()
-        with sqlite3.connect(DB_FILE) as conn:
-            total_u = conn.execute(f"SELECT COUNT(*) FROM users {where}", params_c).fetchone()[0]
-            rows = conn.execute(
-                f"SELECT user_id, username, full_name, tier, daily_limit, credits, is_banned, last_search "
-                f"FROM users {where} ORDER BY user_id DESC LIMIT ? OFFSET ?",
-                params_c + (per_page, offset)
-            ).fetchall()
+
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    if tier_filter:
+                        cur.execute("SELECT COUNT(*) FROM users WHERE tier=%s", (tier_filter,))
+                    else:
+                        cur.execute("SELECT COUNT(*) FROM users")
+                    total_u = cur.fetchone()[0]
+
+                    if tier_filter:
+                        cur.execute(
+                            "SELECT user_id, username, full_name, tier, daily_limit, credits, is_banned, last_search_at "
+                            "FROM users WHERE tier=%s ORDER BY user_id DESC LIMIT %s OFFSET %s",
+                            (tier_filter, per_page, offset)
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT user_id, username, full_name, tier, daily_limit, credits, is_banned, last_search_at "
+                            "FROM users ORDER BY user_id DESC LIMIT %s OFFSET %s",
+                            (per_page, offset)
+                        )
+                    rows = cur.fetchall()
+        except Exception as e:
+            log.error(f"adm_users error: {e}")
+            await q.edit_message_text("❌ Error loading users.", reply_markup=back_admin_kb())
+            return
 
         filter_label = f" [{tier_filter}]" if tier_filter else ""
         text = f"👥 <b>Users{filter_label} — Page {page+1}</b> ({total_u} total)\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1932,7 +1978,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for r in rows:
             uid_r, uname, fname, tier_r, dlimit, credits_r, banned, last_s = r
             icon = "🚫" if banned else "✅"
-            last = (last_s or "")[:10] if last_s else "never"
+            last = (str(last_s) or "")[:10] if last_s else "never"
             text += (
                 f"{icon} <code>{uid_r}</code> <b>{esc(tier_r)}</b> @{esc(uname or 'N/A')} "
                 f"<i>{esc((fname or '')[:15])}</i> cr:{credits_r} last:{last}\n"
@@ -1943,14 +1989,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"👤 {uid_r}", callback_data=f"quick_info:{uid_r}"),
                 InlineKeyboardButton(ban_lbl,       callback_data=ban_cb),
             ])
-        # Tier filter buttons
-        base_f = f"adm_users_p0_f"
+
+        base_f = "adm_users_p0_f"
         filter_row = [
-            InlineKeyboardButton("All",     callback_data="adm_users"),
-            InlineKeyboardButton("⭐",      callback_data=f"{base_f}basic"),
-            InlineKeyboardButton("💎",      callback_data=f"{base_f}premium"),
-            InlineKeyboardButton("👑",      callback_data=f"{base_f}vip"),
-            InlineKeyboardButton("🚫",      callback_data=f"{base_f}banned"),
+            InlineKeyboardButton("All",  callback_data="adm_users"),
+            InlineKeyboardButton("⭐",   callback_data=f"{base_f}basic"),
+            InlineKeyboardButton("💎",   callback_data=f"{base_f}premium"),
+            InlineKeyboardButton("👑",   callback_data=f"{base_f}vip"),
         ]
         kb_rows.append(filter_row)
         nav_buttons = []
@@ -1962,54 +2007,76 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if nav_buttons:
             kb_rows.append(nav_buttons)
         kb_rows.append([InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_home")])
-        await q.edit_message_text(text[:4000], parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_rows)); return
+        await q.edit_message_text(text[:4000], parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_rows))
+        return
 
-    # Quick actions from adm_users list
     if data.startswith("quick_info:"):
         target = int(data.split(":")[1])
-        with sqlite3.connect(DB_FILE) as conn:
-            row = conn.execute("SELECT * FROM users WHERE user_id=?", (target,)).fetchone()
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT * FROM users WHERE user_id=%s", (target,))
+                    row = cur.fetchone()
+        except Exception:
+            row = None
         if not row:
-            await q.answer("User not found.", show_alert=True); return
+            await q.answer("User not found.", show_alert=True)
+            return
         uid_r, uname, fname, tier_r, daily, credits_r, banned, expires, joined, lang_r, ref_by, ref_cnt, last_s, nameid_lim = row[:14]
         status = "🚫 Banned" if banned else "✅ Active"
         await q.answer(
             f"ID:{uid_r} | {tier_r} | cr:{credits_r}\n"
             f"daily:{daily} | nameid:{nameid_lim}\n"
-            f"exp:{(expires or 'none')[:10]} | {status}",
+            f"exp:{str(expires or 'none')[:10]} | {status}",
             show_alert=True
-        ); return
+        )
+        return
 
     if data.startswith("quick_ban:") or data.startswith("quick_unban:"):
         action_q, target_s = data.split(":", 1)
-        target = int(target_s)
+        target  = int(target_s)
         new_ban = 1 if action_q == "quick_ban" else 0
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute("UPDATE users SET is_banned=? WHERE user_id=?", (new_ban, target))
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE users SET is_banned=%s WHERE user_id=%s", (new_ban, target))
+                conn.commit()
+        except Exception as e:
+            log.error(f"quick_ban error: {e}")
         log_admin_op(uid, "quick_ban" if new_ban else "quick_unban", str(target))
         action_label = "🚫 Banned" if new_ban else "✅ Unbanned"
         await q.answer(f"{action_label} user {target}", show_alert=False)
-        # Refresh the users page
         data = "adm_users"
 
     if data == "adm_logs" or data.startswith("adm_logs_p"):
         page = 0
         if data.startswith("adm_logs_p"):
-            try: page = int(data.split("_p")[1])
-            except: page = 0
+            try:
+                page = int(data.split("_p")[1])
+            except Exception:
+                page = 0
         per_page = 20
         offset   = page * per_page
-        with sqlite3.connect(DB_FILE) as conn:
-            total_logs = conn.execute("SELECT COUNT(*) FROM search_logs").fetchone()[0]
-            rows = conn.execute(
-                "SELECT user_id, keyword, category, results, timestamp "
-                "FROM search_logs ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-                (per_page, offset)
-            ).fetchall()
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM search_logs")
+                    total_logs = cur.fetchone()[0]
+                    cur.execute(
+                        "SELECT user_id, keyword, category, results, timestamp "
+                        "FROM search_logs ORDER BY timestamp DESC LIMIT %s OFFSET %s",
+                        (per_page, offset)
+                    )
+                    rows = cur.fetchall()
+        except Exception as e:
+            log.error(f"adm_logs error: {e}")
+            rows = []
+            total_logs = 0
+
         text = f"📜 <b>Search Logs — Page {page+1}</b> ({total_logs:,} total)\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         for r in rows:
             cat_icon = {"email":"📧","phone":"📱","url":"🌐","nameid_name":"🪪"}.get(r[2], "🔍")
-            text += f"{cat_icon} <code>{r[0]}</code> <code>{esc(r[1][:20])}</code> [{esc(r[2])}] — {r[3]}r @ {r[4][:16]}\n"
+            text += f"{cat_icon} <code>{r[0]}</code> <code>{esc(r[1][:20])}</code> [{esc(r[2])}] — {r[3]}r @ {str(r[4])[:16]}\n"
         nav_buttons = []
         if page > 0:
             nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"adm_logs_p{page-1}"))
@@ -2017,29 +2084,42 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"adm_logs_p{page+1}"))
         kb_rows = [nav_buttons] if nav_buttons else []
         kb_rows.append([InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_home")])
-        await q.edit_message_text(text[:4000], parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_rows)); return
+        await q.edit_message_text(text[:4000], parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb_rows))
+        return
 
     if data == "adm_filelist" or data.startswith("adm_filelist_p"):
         page = 0
         if data.startswith("adm_filelist_p"):
-            try: page = int(data.split("_p")[1])
-            except: page = 0
+            try:
+                page = int(data.split("_p")[1])
+            except Exception:
+                page = 0
         per_page = 15
         offset   = page * per_page
-        with sqlite3.connect(DB_FILE) as conn:
-            total_files = conn.execute("SELECT COUNT(*) FROM uploaded_files").fetchone()[0]
-            rows = conn.execute(
-                "SELECT id, original_name, records, size_bytes, uploaded_at "
-                "FROM uploaded_files ORDER BY uploaded_at DESC LIMIT ? OFFSET ?",
-                (per_page, offset)
-            ).fetchall()
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM uploaded_files")
+                    total_files = cur.fetchone()[0]
+                    cur.execute(
+                        "SELECT id, original_name, records, size_bytes, uploaded_at "
+                        "FROM uploaded_files ORDER BY uploaded_at DESC LIMIT %s OFFSET %s",
+                        (per_page, offset)
+                    )
+                    rows = cur.fetchall()
+        except Exception as e:
+            log.error(f"adm_filelist error: {e}")
+            rows = []
+            total_files = 0
+
         if not rows:
             text = "📁 No files uploaded yet."
         else:
             text = f"🗂️ *Uploaded Files — Page {page+1}* ({total_files} total)\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
             for fid, fname, recs, sz, ts in rows:
                 kb = round((sz or 0) / 1024, 1)
-                text += f"`#{fid}` 📄 `{mesc(fname)}`\n    {(recs or 0):,} recs | {kb} KB | {ts[:16]}\n\n"
+                text += f"`#{fid}` 📄 `{mesc(fname)}`\n    {(recs or 0):,} recs | {kb} KB | {str(ts)[:16]}\n\n"
+
         nav_buttons = []
         if page > 0:
             nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"adm_filelist_p{page-1}"))
@@ -2047,7 +2127,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"adm_filelist_p{page+1}"))
         kb_rows = [nav_buttons] if nav_buttons else []
         kb_rows.append([InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_home")])
-        await q.edit_message_text(text[:4000], parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb_rows)); return
+        await q.edit_message_text(text[:4000], parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb_rows))
+        return
 
     if data == "adm_upload_info":
         await q.edit_message_text(
@@ -2063,58 +2144,68 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📌 *Small files (under 20 MB):* Send directly here.\n"
             f"📦 *Large files:* Use `uploader.py` script.",
             parse_mode="Markdown", reply_markup=back_admin_kb()
-        ); return
+        )
+        return
 
     if data == "adm_reset_daily":
-        with sqlite3.connect(DB_FILE) as conn:
-            for tn, td in TIERS.items():
-                conn.execute("UPDATE users SET daily_limit=? WHERE tier=?", (td["daily"], tn))
-            for tn, nd in NAMEID_TIERS.items():
-                conn.execute("UPDATE users SET daily_nameid_limit=? WHERE tier=?", (nd["daily_nameid"], tn))
-        await q.edit_message_text("✅ Daily limits reset for all users (Search DB + Name/ID).", reply_markup=back_admin_kb()); return
+        do_daily_reset()
+        await q.edit_message_text("✅ Daily limits reset for all users (Search DB + Name/ID).", reply_markup=back_admin_kb())
+        return
 
     if data == "adm_advanced_stats":
-        with sqlite3.connect(DB_FILE) as conn:
-            top_searchers = conn.execute(
-                "SELECT user_id, COUNT(*) as cnt FROM search_logs GROUP BY user_id ORDER BY cnt DESC LIMIT 5"
-            ).fetchall()
-            today = datetime.utcnow().strftime("%Y-%m-%d")
-            today_searches = conn.execute(
-                "SELECT COUNT(*) FROM search_logs WHERE timestamp LIKE ?", (f"{today}%",)
-            ).fetchone()[0]
-            top_keywords = conn.execute(
-                "SELECT keyword, COUNT(*) as cnt FROM search_logs GROUP BY keyword ORDER BY cnt DESC LIMIT 5"
-            ).fetchall()
-            new_users_today = conn.execute(
-                "SELECT COUNT(*) FROM users WHERE joined_at LIKE ?", (f"{today}%",)
-            ).fetchone()[0]
-            by_type = conn.execute(
-                "SELECT category, COUNT(*) FROM search_logs GROUP BY category ORDER BY COUNT(*) DESC LIMIT 5"
-            ).fetchall()
-            # Peak hours (UTC)
-            peak_hours = conn.execute(
-                "SELECT SUBSTR(timestamp,12,2) as hr, COUNT(*) as cnt "
-                "FROM search_logs GROUP BY hr ORDER BY cnt DESC LIMIT 3"
-            ).fetchall()
-            # Referral stats
-            top_referrers = conn.execute(
-                "SELECT user_id, referral_count FROM users WHERE referral_count > 0 "
-                "ORDER BY referral_count DESC LIMIT 5"
-            ).fetchall()
-            total_referrals = conn.execute("SELECT SUM(referral_count) FROM users").fetchone()[0] or 0
-            # Search trend: last 7 days
-            week_trend = conn.execute(
-                "SELECT SUBSTR(timestamp,1,10) as day, COUNT(*) "
-                "FROM search_logs WHERE timestamp >= date('now','-7 days') "
-                "GROUP BY day ORDER BY day DESC"
-            ).fetchall()
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT user_id, COUNT(*) as cnt FROM search_logs GROUP BY user_id ORDER BY cnt DESC LIMIT 5"
+                    )
+                    top_searchers = cur.fetchall()
+                    today = datetime.utcnow().strftime("%Y-%m-%d")
+                    cur.execute(
+                        "SELECT COUNT(*) FROM search_logs WHERE timestamp LIKE %s", (f"{today}%",)
+                    )
+                    today_searches = cur.fetchone()[0]
+                    cur.execute(
+                        "SELECT keyword, COUNT(*) as cnt FROM search_logs GROUP BY keyword ORDER BY cnt DESC LIMIT 5"
+                    )
+                    top_keywords = cur.fetchall()
+                    cur.execute(
+                        "SELECT COUNT(*) FROM users WHERE joined_at LIKE %s", (f"{today}%",)
+                    )
+                    new_users_today = cur.fetchone()[0]
+                    cur.execute(
+                        "SELECT category, COUNT(*) FROM search_logs GROUP BY category ORDER BY COUNT(*) DESC LIMIT 5"
+                    )
+                    by_type = cur.fetchall()
+                    cur.execute(
+                        "SELECT SUBSTRING(timestamp, 12, 2) as hr, COUNT(*) as cnt "
+                        "FROM search_logs GROUP BY hr ORDER BY cnt DESC LIMIT 3"
+                    )
+                    peak_hours = cur.fetchall()
+                    cur.execute(
+                        "SELECT user_id, referral_count FROM users WHERE referral_count > 0 "
+                        "ORDER BY referral_count DESC LIMIT 5"
+                    )
+                    top_referrers = cur.fetchall()
+                    cur.execute("SELECT COALESCE(SUM(referral_count), 0) FROM users")
+                    total_referrals = cur.fetchone()[0]
+                    cur.execute(
+                        "SELECT SUBSTRING(timestamp, 1, 10) as day, COUNT(*) "
+                        "FROM search_logs WHERE timestamp >= CURRENT_DATE - INTERVAL '7 days' "
+                        "GROUP BY day ORDER BY day DESC"
+                    )
+                    week_trend = cur.fetchall()
+        except Exception as e:
+            log.error(f"adm_advanced_stats error: {e}")
+            await q.edit_message_text("❌ Stats error.", reply_markup=back_admin_kb())
+            return
 
         top_s_lines   = "\n".join([f"  `{r[0]}` — {r[1]}x" for r in top_searchers]) or "  No data"
         top_k_lines   = "\n".join([f"  `{mesc(r[0][:20])}` — {r[1]}x" for r in top_keywords]) or "  No data"
         by_type_lines = "\n".join([f"  {r[0] or 'N/A'}: `{r[1]}`" for r in by_type]) or "  No data"
         peak_lines    = " | ".join([f"`{r[0]}:00` ({r[1]})" for r in peak_hours]) or "No data"
         ref_lines     = "\n".join([f"  `{r[0]}` — {r[1]} referrals" for r in top_referrers]) or "  No referrals yet"
-        trend_lines   = " | ".join([f"`{r[0][5:]}` {r[1]}" for r in week_trend]) or "No data"
+        trend_lines   = " | ".join([f"`{str(r[0])[5:]}` {r[1]}" for r in week_trend]) or "No data"
 
         await q.edit_message_text(
             f"📈 *Advanced Statistics*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2127,19 +2218,26 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📂 *Searches by Type:*\n{by_type_lines}\n\n"
             f"🔗 *Referrals:* `{total_referrals}` total\n{ref_lines}",
             parse_mode="Markdown", reply_markup=back_admin_kb()
-        ); return
+        )
+        return
 
     if data == "adm_broadcast":
         context.user_data["admin_action"] = "broadcast"
-        with sqlite3.connect(DB_FILE) as conn:
-            user_count = conn.execute("SELECT COUNT(*) FROM users WHERE is_banned=0").fetchone()[0]
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM users WHERE is_banned=0")
+                    user_count = cur.fetchone()[0]
+        except Exception:
+            user_count = 0
         await q.edit_message_text(
             f"📢 *Broadcast Message*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"👥 Will be sent to *{user_count}* active users.\n\n"
             f"✏️ Send your message now:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="adm_home")]])
-        ); return
+        )
+        return
 
     if data == "adm_msg_user":
         context.user_data["admin_action"] = "msg_user"
@@ -2149,50 +2247,66 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Example: `123456789 Your account is ready!`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="adm_home")]])
-        ); return
+        )
+        return
 
     if data == "my_history":
         is_ar = get_lang(uid) == "ar"
-        with sqlite3.connect(DB_FILE) as conn:
-            rows = conn.execute(
-                "SELECT keyword, category, results, timestamp FROM search_logs "
-                "WHERE user_id=? ORDER BY timestamp DESC LIMIT 15",
-                (uid,)
-            ).fetchall()
-            total = conn.execute("SELECT COUNT(*) FROM search_logs WHERE user_id=?", (uid,)).fetchone()[0]
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT keyword, category, results, timestamp FROM search_logs "
+                        "WHERE user_id=%s ORDER BY timestamp DESC LIMIT 15",
+                        (uid,)
+                    )
+                    rows = cur.fetchall()
+                    cur.execute("SELECT COUNT(*) FROM search_logs WHERE user_id=%s", (uid,))
+                    total = cur.fetchone()[0]
+        except Exception:
+            rows = []
+            total = 0
+
         if not rows:
             txt = "📜 *بحوثي الأخيرة*\n\nلا توجد بحوث بعد." if is_ar else "📜 *My Search History*\n\nNo searches yet."
         else:
             title = "📜 *بحوثي الأخيرة*" if is_ar else "📜 *My Search History*"
-            txt = f"{title}\n━━━━━━━━━━━━━━━━━━━━━━\n"
-            txt += f"({'إجمالي' if is_ar else 'Total'}: {total})\n\n"
+            txt = f"{title}\n━━━━━━━━━━━━━━━━━━━━━━\n({'إجمالي' if is_ar else 'Total'}: {total})\n\n"
             type_icons = {
-                "email": "📧", "phone": "📱", "url": "🌐", "domain": "🌍",
-                "login": "👤", "username": "📝", "password": "🔑", "all": "🔎",
-                "nameid_name": "🪪", "nameid_national_id": "🪪", "nameid_partial_id": "🔢",
+                "email":"📧","phone":"📱","url":"🌐","domain":"🌍",
+                "login":"👤","username":"📝","password":"🔑","all":"🔎",
+                "nameid_name":"🪪","nameid_national_id":"🪪","nameid_partial_id":"🔢",
             }
             for kw, cat, res, ts in rows:
                 icon = type_icons.get(cat, "🔍")
                 cat_label = cat.replace("nameid_", "").replace("_", " ").upper()
-                txt += f"{icon} `{mesc(kw[:22])}` `{cat_label}` — *{res}* | {ts[:10]}\n"
+                txt += f"{icon} `{mesc(kw[:22])}` `{cat_label}` — *{res}* | {str(ts)[:10]}\n"
+
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑️ مسح التاريخ" if is_ar else "🗑️ Clear History", callback_data="clear_history")],
             [InlineKeyboardButton("🔙 القائمة الرئيسية" if is_ar else "🔙 Main Menu", callback_data="user_home")],
         ])
-        await q.edit_message_text(txt[:4000], parse_mode="Markdown", reply_markup=kb); return
+        await q.edit_message_text(txt[:4000], parse_mode="Markdown", reply_markup=kb)
+        return
 
     if data == "clear_history":
         is_ar = get_lang(uid) == "ar"
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute("DELETE FROM search_logs WHERE user_id=?", (uid,))
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM search_logs WHERE user_id=%s", (uid,))
+                conn.commit()
+        except Exception as e:
+            log.error(f"clear_history error: {e}")
         txt = "✅ *تم مسح تاريخ البحث بنجاح.*" if is_ar else "✅ *Search history cleared.*"
-        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=back_user_kb(uid)); return
+        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=back_user_kb(uid))
+        return
 
     if data == "my_referral":
-        is_ar = get_lang(uid) == "ar"
+        is_ar     = get_lang(uid) == "ar"
         ref_count = get_referral_stats(uid)
         bot_username = (await context.bot.get_me()).username
-        ref_link = f"https://t.me/{bot_username}?start={uid}"
+        ref_link  = f"https://t.me/{bot_username}?start={uid}"
         if is_ar:
             txt = (
                 f"🔗 *رابط الإحالة الخاص بك*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2209,7 +2323,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💰 Earn *{REFERRAL_CREDITS}* credits per new user!\n\n"
                 f"Every friend who opens the bot via your link earns you credits ✅"
             )
-        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=back_user_kb(uid)); return
+        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=back_user_kb(uid))
+        return
 
     if data == "my_id":
         is_ar = get_lang(uid) == "ar"
@@ -2218,7 +2333,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_ar else
             f"🆔 *Your Telegram ID:*\n\n`{uid}`\n\n_Share this with the admin to manage your account_"
         )
-        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=back_user_kb(uid)); return
+        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=back_user_kb(uid))
+        return
+
+    if data == "adm_set_expiry":
         context.user_data["admin_action"] = "set_expiry"
         await q.edit_message_text(
             "📅 *Set Subscription Expiry*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2227,7 +2345,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send `USER_ID 0` to clear expiry.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="adm_home")]])
-        ); return
+        )
+        return
 
     if data == "adm_filter_logs":
         context.user_data["admin_action"] = "filter_logs"
@@ -2237,22 +2356,30 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Or send a *keyword* to find searches containing it:\n`gmail.com`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="adm_home")]])
-        ); return
+        )
+        return
 
     if data == "adm_export_csv":
-        with sqlite3.connect(DB_FILE) as conn:
-            rows = conn.execute(
-                "SELECT user_id, username, full_name, tier, daily_limit, credits, is_banned, expires_at, joined_at, lang, referral_count "
-                "FROM users ORDER BY user_id DESC"
-            ).fetchall()
-        import csv, io
-        output = io.StringIO()
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT user_id, username, full_name, tier, daily_limit, credits, is_banned, "
+                        "expires_at, joined_at, lang, referral_count FROM users ORDER BY user_id DESC"
+                    )
+                    rows = cur.fetchall()
+        except Exception as e:
+            log.error(f"adm_export_csv error: {e}")
+            rows = []
+
+        import csv
+        import io as _io
+        output = _io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["user_id","username","full_name","tier","daily_limit","credits","is_banned","expires_at","joined_at","lang","referral_count"])
         writer.writerows(rows)
         csv_bytes = output.getvalue().encode("utf-8-sig")
-        filename = f"users_export_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv"
-        import io as _io
+        filename  = f"users_export_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv"
         await context.bot.send_document(
             chat_id=uid,
             document=_io.BytesIO(csv_bytes),
@@ -2261,30 +2388,37 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         log_admin_op(uid, "export_csv", "users", f"{len(rows)} rows")
-        await q.edit_message_text("✅ CSV sent to you.", reply_markup=back_admin_kb()); return
+        await q.edit_message_text("✅ CSV sent to you.", reply_markup=back_admin_kb())
+        return
+
+    if data == "adm_backup":
         try:
             dest = backup_db()
-            size = round(os.path.getsize(dest) / 1024 / 1024, 2)
-            backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith(".db")], reverse=True)
+            backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith(".txt")], reverse=True)
             await q.edit_message_text(
-                f"💾 *Database Backed Up!*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"💾 *Backup Note Created!*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"📄 File: `{os.path.basename(dest)}`\n"
-                f"💽 Size: `{size} MB`\n"
-                f"🗂️ Total backups kept: `{len(backups)}`\n\n"
-                f"_(Older backups auto-deleted, max 7 kept)_",
+                f"ℹ️ For PostgreSQL, run: `pg_dump -U postgres scanner > backup.sql`\n"
+                f"🗂️ Total markers kept: `{len(backups)}`",
                 parse_mode="Markdown", reply_markup=back_admin_kb()
             )
-            log_admin_op(uid, "backup_db", dest, f"{size} MB")
+            log_admin_op(uid, "backup_db", dest, "pg marker")
         except Exception as e:
             await q.edit_message_text(f"❌ Backup failed: `{e}`", parse_mode="Markdown", reply_markup=back_admin_kb())
         return
 
     if data == "adm_sub_requests":
-        with sqlite3.connect(DB_FILE) as conn:
-            rows = conn.execute(
-                "SELECT id, user_id, username, full_name, requested_tier, status, timestamp "
-                "FROM sub_requests ORDER BY timestamp DESC LIMIT 20"
-            ).fetchall()
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, user_id, username, full_name, requested_tier, status, timestamp "
+                        "FROM sub_requests ORDER BY timestamp DESC LIMIT 20"
+                    )
+                    rows = cur.fetchall()
+        except Exception:
+            rows = []
+
         if not rows:
             text = "📋 *طلبات الاشتراك*\n\nلا توجد طلبات حتى الآن."
         else:
@@ -2294,14 +2428,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += (
                     f"{status_icon} `#{r[0]}` | <code>{r[1]}</code>\n"
                     f"  👤 {esc(r[3] or 'User')} (@{esc(r[2] or 'N/A')})\n"
-                    f"  📦 Tier: `{esc(r[4])}` | {r[6][:10]}\n\n"
+                    f"  📦 Tier: `{esc(r[4])}` | {str(r[6])[:10]}\n\n"
                 )
+
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ قبول طلب",  callback_data="adm_approve_sub"),
              InlineKeyboardButton("❌ رفض طلب",   callback_data="adm_reject_sub")],
             [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_home")],
         ])
-        await q.edit_message_text(text[:4000], parse_mode="HTML", reply_markup=kb); return
+        await q.edit_message_text(text[:4000], parse_mode="HTML", reply_markup=kb)
+        return
 
     if data == "adm_approve_sub":
         context.user_data["admin_action"] = "sub_request_approve"
@@ -2309,7 +2445,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ *قبول طلب اشتراك*\n\nأرسل: `REQUEST_ID` أو `REQUEST_ID TIER` لتغيير الباقة\nمثال: `5` أو `5 premium`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="adm_sub_requests")]])
-        ); return
+        )
+        return
 
     if data == "adm_reject_sub":
         context.user_data["admin_action"] = "sub_request_reject"
@@ -2317,14 +2454,21 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ *رفض طلب اشتراك*\n\nأرسل رقم الطلب:\nمثال: `5`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="adm_sub_requests")]])
-        ); return
+        )
+        return
 
     if data == "adm_op_logs":
-        with sqlite3.connect(DB_FILE) as conn:
-            rows = conn.execute(
-                "SELECT admin_id, action, target, details, timestamp "
-                "FROM admin_op_logs ORDER BY timestamp DESC LIMIT 30"
-            ).fetchall()
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT admin_id, action, target, details, timestamp "
+                        "FROM admin_op_logs ORDER BY timestamp DESC LIMIT 30"
+                    )
+                    rows = cur.fetchall()
+        except Exception:
+            rows = []
+
         if not rows:
             text = "📜 *سجل عمليات الأدمن*\n\nلا توجد عمليات مسجلة بعد."
         else:
@@ -2332,79 +2476,102 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for r in rows:
                 text += (
                     f"👤 <code>{r[0]}</code> → <b>{esc(r[1])}</b>\n"
-                    f"  🎯 {esc(r[2])} | {esc(r[3] or '')} | {r[4][:16]}\n\n"
+                    f"  🎯 {esc(r[2])} | {esc(r[3] or '')} | {str(r[4])[:16]}\n\n"
                 )
-        await q.edit_message_text(text[:4000], parse_mode="HTML", reply_markup=back_admin_kb()); return
+        await q.edit_message_text(text[:4000], parse_mode="HTML", reply_markup=back_admin_kb())
+        return
 
     if data == "adm_bot_status":
         import platform, sys
-        with sqlite3.connect(DB_FILE) as conn:
-            total_records = conn.execute("SELECT COUNT(*) FROM data_index").fetchone()[0]
-            total_nameid  = conn.execute("SELECT COUNT(*) FROM name_id_index").fetchone()[0]
-            total_users   = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-            total_files   = conn.execute("SELECT COUNT(*) FROM uploaded_files").fetchone()[0]
-            total_searches= conn.execute("SELECT COUNT(*) FROM search_logs").fetchone()[0]
-            db_size = os.path.getsize(DB_FILE) if os.path.exists(DB_FILE) else 0
-        files_size = sum(
-            os.path.getsize(os.path.join(FILES_DIR, f))
-            for f in os.listdir(FILES_DIR)
-            if os.path.isfile(os.path.join(FILES_DIR, f))
-        ) if os.path.exists(FILES_DIR) else 0
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM data_index")
+                    total_records = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM name_id_index")
+                    total_nameid = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM users")
+                    total_users = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM uploaded_files")
+                    total_files = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM search_logs")
+                    total_searches = cur.fetchone()[0]
+                    cur.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM uploaded_files")
+                    files_size = cur.fetchone()[0]
+        except Exception:
+            total_records = total_nameid = total_users = total_files = total_searches = files_size = 0
+
         now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
         await q.edit_message_text(
             f"⚡ *Bot Status*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"🟢 *Status:* Online\n"
             f"🕐 *Time (UTC):* `{now_utc}`\n"
             f"🐍 *Python:* `{sys.version.split()[0]}`\n"
-            f"🖥️ *OS:* `{platform.system()} {platform.release()}`\n\n"
+            f"🖥️ *OS:* `{platform.system()} {platform.release()}`\n"
+            f"🐘 *DB:* PostgreSQL\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🗄️ DB Records: `{total_records:,}`\n"
             f"🪪 Name/ID:    `{total_nameid:,}`\n"
             f"👥 Users:      `{total_users:,}`\n"
             f"📁 Files:      `{total_files}`\n"
             f"🔍 Searches:   `{total_searches:,}`\n\n"
-            f"💾 DB Size:    `{round(db_size/1024/1024, 2)} MB`\n"
-            f"📦 Files Size: `{round(files_size/1024/1024, 2)} MB`",
+            f"📦 Files Size: `{round((files_size or 0)/1024/1024, 2)} MB`",
             parse_mode="Markdown", reply_markup=back_admin_kb()
-        ); return
+        )
+        return
 
     if data == "adm_toggle_maintenance":
         global MAINTENANCE_MODE
         MAINTENANCE_MODE = not MAINTENANCE_MODE
-        status = "🔧 *Maintenance mode ENABLED.*\n\nAll non-admin users will see the maintenance message." if MAINTENANCE_MODE \
-            else "✅ *Maintenance mode DISABLED.*\n\nBot is open to all users again."
-        await q.edit_message_text(status, parse_mode="Markdown", reply_markup=back_admin_kb()); return
+        status = (
+            "🔧 *Maintenance mode ENABLED.*\n\nAll non-admin users will see the maintenance message."
+            if MAINTENANCE_MODE else
+            "✅ *Maintenance mode DISABLED.*\n\nBot is open to all users again."
+        )
+        await q.edit_message_text(status, parse_mode="Markdown", reply_markup=back_admin_kb())
+        return
 
     action_map = {
-        "adm_add_credits": ("add_credits", "💰 *Add / Deduct Credits*\n\nSend: `USER_ID AMOUNT`\nExample: `123456789 500`\n\n_Use negative to deduct: `123456789 -50`_"),
-        "adm_set_tier":    ("set_tier",    f"⬆️ *Set User Tier*\n\nSend: `USER_ID TIER`\n\nTiers: `free` | `basic` | `premium` | `vip`"),
-        "adm_ban":         ("ban",         "🔒 *Ban User*\n\nSend the User ID to ban:"),
-        "adm_unban":       ("unban",       "✅ *Unban User*\n\nSend the User ID to unban:"),
-        "adm_freeze":          ("freeze",          "🧊 *Freeze User Temporarily*\n\nSend: `USER_ID HOURS`\nExample: `123456789 24` → freeze for 24 hours"),
-        "adm_adduser_inline":  ("adduser_inline",   "➕ *Add User*\n\nSend: `USER_ID TIER`\nExample: `123456789 basic`\n\nTiers: `free` | `basic` | `premium` | `vip`"),
-        "adm_deluser":         ("deluser",           "🗑️ *Delete User*\n\nSend the User ID to permanently delete from DB:"),
+        "adm_add_credits":    ("add_credits",    "💰 *Add / Deduct Credits*\n\nSend: `USER_ID AMOUNT`\nExample: `123456789 500`\n\n_Use negative to deduct: `123456789 -50`_"),
+        "adm_set_tier":       ("set_tier",        f"⬆️ *Set User Tier*\n\nSend: `USER_ID TIER`\n\nTiers: `free` | `basic` | `premium` | `vip`"),
+        "adm_ban":            ("ban",             "🔒 *Ban User*\n\nSend the User ID to ban:"),
+        "adm_unban":          ("unban",           "✅ *Unban User*\n\nSend the User ID to unban:"),
+        "adm_freeze":         ("freeze",          "🧊 *Freeze User Temporarily*\n\nSend: `USER_ID HOURS`\nExample: `123456789 24` → freeze for 24 hours"),
+        "adm_adduser_inline": ("adduser_inline",  "➕ *Add User*\n\nSend: `USER_ID TIER`\nExample: `123456789 basic`\n\nTiers: `free` | `basic` | `premium` | `vip`"),
+        "adm_deluser":        ("deluser",         "🗑️ *Delete User*\n\nSend the User ID to permanently delete from DB:"),
     }
     if data in action_map:
         action, prompt = action_map[data]
         context.user_data["admin_action"] = action
-        await q.edit_message_text(prompt, parse_mode="Markdown",
+        await q.edit_message_text(
+            prompt, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="adm_home")]])
-        ); return
+        )
+        return
 
     if data == "adm_delete_file":
         context.user_data["admin_action"] = "delete_file"
-        with sqlite3.connect(DB_FILE) as conn:
-            files = conn.execute(
-                "SELECT id, original_name, records FROM uploaded_files ORDER BY uploaded_at DESC LIMIT 20"
-            ).fetchall()
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, original_name, records FROM uploaded_files ORDER BY uploaded_at DESC LIMIT 20"
+                    )
+                    files = cur.fetchall()
+        except Exception:
+            files = []
+
         if not files:
-            await q.edit_message_text("No files to delete.", reply_markup=back_admin_kb()); return
+            await q.edit_message_text("No files to delete.", reply_markup=back_admin_kb())
+            return
         text = "🗑️ *Delete File*\n\nSend the file ID:\n\n"
         for fid, fname, recs in files:
-            text += f"`#{fid}` — `{fname}` ({recs:,} records)\n"
-        await q.edit_message_text(text, parse_mode="Markdown",
+            text += f"`#{fid}` — `{fname}` ({(recs or 0):,} records)\n"
+        await q.edit_message_text(
+            text, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="adm_home")]])
-        ); return
+        )
+        return
 
 # ════════════════════════════════════════════
 #          TEXT HANDLER + SEARCH LOGIC
@@ -2415,16 +2582,23 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(uid, update.effective_user.username or "", update.effective_user.first_name or "")
 
     if is_banned(uid) and not is_admin(uid):
-        await update.message.reply_text("🚫 *Your account has been banned.*\n\nPlease contact the admin if you have any questions.", parse_mode="Markdown"); return
+        await update.message.reply_text(
+            "🚫 *Your account has been banned.*\n\nPlease contact the admin if you have any questions.",
+            parse_mode="Markdown"
+        )
+        return
 
     if is_admin(uid) and "admin_action" in context.user_data:
-        await handle_admin_text(update, context, context.user_data.pop("admin_action"), text); return
+        await handle_admin_text(update, context, context.user_data.pop("admin_action"), text)
+        return
 
     if "search_type" in context.user_data:
         stype = context.user_data.pop("search_type")
         if stype in ("ni_name", "ni_national_id"):
-            await show_nameid_counter(update, context, text, stype); return
-        await show_search_counter(update, context, text, stype); return
+            await show_nameid_counter(update, context, text, stype)
+            return
+        await show_search_counter(update, context, text, stype)
+        return
 
     if is_admin(uid):
         await update.message.reply_text("⚙️ Admin Panel:", reply_markup=admin_main_kb())
@@ -2432,29 +2606,27 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use the menu:", reply_markup=user_main_kb(uid))
 
 # ════════════════════════════════════════════
-#    NEW: COUNTER PREVIEW BEFORE DOWNLOAD
+#    COUNTER PREVIEW BEFORE DOWNLOAD
 # ════════════════════════════════════════════
 async def show_search_counter(update: Update, context: ContextTypes.DEFAULT_TYPE, keyword: str, stype: str):
-    """Show available result count and ask user to confirm download."""
     uid = update.effective_user.id
 
-    # Minimum keyword length
     if len(keyword.strip()) < MIN_KEYWORD_LEN:
         await update.message.reply_text(
             f"❌ *Keyword too short!*\n\nMinimum *{MIN_KEYWORD_LEN} characters* required.\nTry a more specific keyword.",
             parse_mode="Markdown", reply_markup=back_user_kb(uid)
-        ); return
+        )
+        return
 
     if is_search_spamming(uid):
-        await update.message.reply_text(
-            "⏳ Please wait a few seconds before searching again.",
-            reply_markup=back_user_kb(uid)
-        ); return
+        await update.message.reply_text("⏳ Please wait a few seconds before searching again.", reply_markup=back_user_kb(uid))
+        return
     if not can_search(uid):
         await update.message.reply_text(
             "❌ No searches remaining. Upgrade your plan.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 View Plans", callback_data="show_plans")]])
-        ); return
+        )
+        return
 
     u     = get_user(uid)
     tier  = u[3] if u else "free"
@@ -2466,7 +2638,6 @@ async def show_search_counter(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="Markdown"
     )
 
-    # Fast count (no full parse, just LIKE match)
     raw_count = await asyncio.get_running_loop().run_in_executor(
         None, lambda: count_matches_fast(keyword, stype)
     )
@@ -2487,14 +2658,13 @@ async def show_search_counter(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"• Try a different search type: {suggestions}\n"
             f"• Use `Full Scan` to search all types at once",
             parse_mode="Markdown", reply_markup=new_search_kb()
-        ); return
+        )
+        return
 
-    # Encode keyword safely for callback_data (max 64 bytes total)
-    safe_kw = keyword[:40]
+    safe_kw    = keyword[:40]
     cb_confirm = _cb_put(f"confirm_search:{stype}:{safe_kw}")
     cb_cancel  = "cancel_search"
 
-    # Fetch 3 preview results (fast, no deduction)
     preview_results = await asyncio.get_running_loop().run_in_executor(
         None, lambda: smart_search(keyword, stype, 3)
     )
@@ -2534,10 +2704,8 @@ async def show_search_counter(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 async def show_nameid_counter(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, stype: str):
-    """Show Name/ID count before download — uses separate NAMEID_TIERS quota."""
     uid = update.effective_user.id
 
-    # ── Input validation ──────────────────────────────────
     if stype == "ni_national_id":
         cleaned = re.sub(r"\s", "", query)
         if not re.fullmatch(r"\d{4,14}", cleaned):
@@ -2545,39 +2713,43 @@ async def show_nameid_counter(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "❌ *رقم غير صالح!*\n\nأدخل رقماً يتكون من 4 إلى 14 رقماً فقط.\n_مثال: `30604` أو `30604150100123`_",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="go_nameid")]])
-            ); return
+            )
+            return
     elif stype == "ni_name":
         if len(query.strip()) < 2:
             await update.message.reply_text(
                 "❌ *الاسم قصير جداً!*\n\nأدخل اسماً من حرفين على الأقل.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="go_nameid")]])
-            ); return
+            )
+            return
         if re.fullmatch(r"[\d\s]+", query.strip()):
             await update.message.reply_text(
                 "❌ *الاسم يجب أن يحتوي على حروف!*\n\nلبحث بالرقم اختر 🪪 بحث بالرقم القومي.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="go_nameid")]])
-            ); return
+            )
+            return
+
     if is_search_spamming(uid):
-        await update.message.reply_text(
-            "⏳ Please wait a few seconds before searching again.",
-            reply_markup=back_user_kb(uid)
-        ); return
+        await update.message.reply_text("⏳ Please wait a few seconds before searching again.", reply_markup=back_user_kb(uid))
+        return
     if not can_search_nameid(uid):
         is_ar = get_lang(uid) == "ar"
-        if is_ar:
-            msg = "❌ *انتهت بحوث Name/ID لليوم.*\n\nقم بترقية باقتك للحصول على المزيد."
-        else:
-            msg = "❌ *Name/ID searches used up for today.*\n\nUpgrade your plan for more."
-        await update.message.reply_text(msg, parse_mode="Markdown",
+        msg_out = (
+            "❌ *انتهت بحوث Name/ID لليوم.*\n\nقم بترقية باقتك للحصول على المزيد."
+            if is_ar else
+            "❌ *Name/ID searches used up for today.*\n\nUpgrade your plan for more."
+        )
+        await update.message.reply_text(
+            msg_out, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💳 Plans", callback_data="show_plans")],
-                [InlineKeyboardButton("🔙 Back", callback_data="user_home")],
+                [InlineKeyboardButton("🔙 Back",  callback_data="user_home")],
             ])
-        ); return
+        )
+        return
 
-    u     = get_user(uid)
     limit = get_nameid_limit(uid)
     mark_search_time(uid)
 
@@ -2603,21 +2775,18 @@ async def show_nameid_counter(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if raw_count == 0:
         await msg.edit_text(
-            f"🔍 *لا توجد نتائج*\n\n"
-            f"Query: `{mesc(query)}`\n\n"
-            f"💡 *اقتراحات:*\n"
-            f"• جرب اسماً أقصر أو جزءاً من الرقم\n"
-            f"• تأكد من الإملاء الصحيح",
+            f"🔍 *لا توجد نتائج*\n\nQuery: `{mesc(query)}`\n\n"
+            f"💡 *اقتراحات:*\n• جرب اسماً أقصر أو جزءاً من الرقم\n• تأكد من الإملاء الصحيح",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🪪 بحث جديد", callback_data="go_nameid")],
                 [InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")],
             ])
-        ); return
+        )
+        return
 
-    # Fetch 3 preview results (fast, no deduction)
     preview_results = await asyncio.get_running_loop().run_in_executor(
-        None, lambda: search_by_name(query, 3) if qtype == "name" else search_by_national_id(query, 3)
+        None, lambda: (search_by_name(query, 3) if qtype == "name" else search_by_national_id(query, 3))
     )
     preview_lines = ""
     if preview_results:
@@ -2653,10 +2822,10 @@ async def show_nameid_counter(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def do_nameid_search(update: Update, context: ContextTypes.DEFAULT_TYPE,
                            query: str, stype: str, reply_to=None):
     uid = update.effective_user.id
-    # Prevent concurrent searches for same user
     if context.user_data.get("search_running"):
         send_fn = reply_to.reply_text if reply_to else update.message.reply_text
-        await send_fn("⏳ A search is already in progress. Please wait."); return
+        await send_fn("⏳ A search is already in progress. Please wait.")
+        return
     context.user_data["search_running"] = True
     try:
         if not can_search_nameid(uid):
@@ -2665,7 +2834,8 @@ async def do_nameid_search(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 "❌ *Name/ID searches used up for today.*\n\nUpgrade your plan for more.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Plans", callback_data="show_plans")]])
-            ); return
+            )
+            return
 
         limit = get_nameid_limit(uid)
 
@@ -2709,7 +2879,8 @@ async def do_nameid_search(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     [InlineKeyboardButton("🪪 بحث جديد", callback_data="go_nameid")],
                     [InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")],
                 ])
-            ); return
+            )
+            return
 
         if len(results) <= 3:
             lines = [f"✅ *نتائج البحث* — `{len(results)}` نتيجة\n"]
@@ -2721,7 +2892,8 @@ async def do_nameid_search(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     [InlineKeyboardButton("🪪 بحث جديد", callback_data="go_nameid")],
                     [InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")],
                 ])
-            ); return
+            )
+            return
 
         content  = build_nameid_result_txt(query, results, qtype)
         safe_kw  = re.sub(r"[^\w\-]", "_", query)[:30]
@@ -2748,7 +2920,7 @@ async def do_nameid_search(update: Update, context: ContextTypes.DEFAULT_TYPE,
             with zipfile.ZipFile(zippath, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.write(tmppath, filename)
             send_path, send_filename = zippath, filename + ".zip"
-            caption += f"\n📦 Compressed: `{round(file_size_kb/1024,1)} MB → {round(os.path.getsize(zippath)/1024,1)} KB`"
+            caption += f"\n📦 Compressed"
         else:
             send_path, send_filename = tmppath, filename
 
@@ -2769,14 +2941,16 @@ async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     keyword: str, stype: str, reply_to=None):
     uid = update.effective_user.id
     if context.user_data.get("search_running"):
-        await update.message.reply_text("⏳ A search is already in progress. Please wait."); return
+        await update.message.reply_text("⏳ A search is already in progress. Please wait.")
+        return
     context.user_data["search_running"] = True
     try:
         if not can_search(uid):
             await update.message.reply_text(
                 "❌ No searches remaining. Upgrade your plan.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 View Plans", callback_data="show_plans")]])
-            ); return
+            )
+            return
 
         u     = get_user(uid)
         tier  = u[3] if u else "free"
@@ -2809,7 +2983,8 @@ async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 f"• Try a different type: {suggestions}\n"
                 f"• Use `Full Scan` to search all types",
                 parse_mode="Markdown", reply_markup=new_search_kb()
-            ); return
+            )
+            return
 
         content  = build_result_txt(keyword, results, stype)
         safe_kw  = re.sub(r"[^\w\-]", "_", keyword)[:30]
@@ -2840,7 +3015,7 @@ async def do_search(update: Update, context: ContextTypes.DEFAULT_TYPE,
             with zipfile.ZipFile(zippath, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.write(tmppath, filename)
             send_path, send_filename = zippath, filename + ".zip"
-            caption += f"\n📦 Compressed: `{round(file_size_kb/1024,1)} MB → {round(os.path.getsize(zippath)/1024,1)} KB`"
+            caption += f"\n📦 Compressed"
         else:
             send_path, send_filename = tmppath, filename
 
@@ -2857,7 +3032,8 @@ async def run_search_with_timer(msg, keyword: str, stype: str, limit: int) -> li
         for elapsed in intervals:
             await asyncio.sleep(15)
             remaining = total_secs - elapsed
-            if remaining <= 0: break
+            if remaining <= 0:
+                break
             pct  = int((elapsed / total_secs) * 100)
             fill = int(bar_chars * pct / 100)
             bar  = "█" * fill + "░" * (bar_chars - fill)
@@ -2901,94 +3077,141 @@ async def handle_admin_text(update, context, action, text):
             await update.message.reply_text(
                 "❌ Format: `USER_ID AMOUNT`\n\n_Use negative to deduct, e.g. `123456 -50`_",
                 parse_mode="Markdown", reply_markup=back_admin_kb()
-            ); return
+            )
+            return
         target, amount = int(parts[0]), int(parts[1])
-        with sqlite3.connect(DB_FILE) as conn:
-            if amount < 0:
-                # Deduct but floor at 0
-                conn.execute(
-                    "UPDATE users SET credits=MAX(0, credits+?) WHERE user_id=?", (amount, target)
-                )
-                row = conn.execute("SELECT credits FROM users WHERE user_id=?", (target,)).fetchone()
-                new_balance = row[0] if row else 0
-                result_msg = f"✅ Deducted `{abs(amount)}` credits from user `{target}`. New balance: `{new_balance}`."
-            else:
-                conn.execute("UPDATE users SET credits=credits+? WHERE user_id=?", (amount, target))
-                result_msg = f"✅ Added `{amount}` credits to user `{target}`."
-            conn.execute("INSERT INTO sub_history VALUES (?,?,?,?,?)",
-                         (target, "credits", amount, uid, datetime.utcnow().isoformat()))
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    if amount < 0:
+                        cur.execute(
+                            "UPDATE users SET credits=GREATEST(0, credits+%s) WHERE user_id=%s",
+                            (amount, target)
+                        )
+                        cur.execute("SELECT credits FROM users WHERE user_id=%s", (target,))
+                        row = cur.fetchone()
+                        new_balance = row[0] if row else 0
+                        result_msg = f"✅ Deducted `{abs(amount)}` credits from user `{target}`. New balance: `{new_balance}`."
+                    else:
+                        cur.execute("UPDATE users SET credits=credits+%s WHERE user_id=%s", (amount, target))
+                        result_msg = f"✅ Added `{amount}` credits to user `{target}`."
+                    cur.execute("INSERT INTO sub_history VALUES (%s,%s,%s,%s,%s)",
+                                (target, "credits", amount, uid, datetime.utcnow().isoformat()))
+                conn.commit()
+        except Exception as e:
+            log.error(f"add_credits error: {e}")
+            result_msg = f"❌ Error: {e}"
         await update.message.reply_text(result_msg, parse_mode="Markdown", reply_markup=back_admin_kb())
         log_admin_op(uid, "add_credits", str(target), f"{amount:+} credits")
 
     elif action == "set_tier":
         if len(parts) != 2 or parts[1] not in TIERS:
-            await update.message.reply_text(f"❌ Format: `USER_ID TIER`\nTiers: {', '.join(TIERS)}", parse_mode="Markdown", reply_markup=back_admin_kb()); return
+            await update.message.reply_text(
+                f"❌ Format: `USER_ID TIER`\nTiers: {', '.join(TIERS)}",
+                parse_mode="Markdown", reply_markup=back_admin_kb()
+            )
+            return
         target, new_tier = int(parts[0]), parts[1]
         t  = TIERS[new_tier]
         nt = NAMEID_TIERS[new_tier]
-        with sqlite3.connect(DB_FILE) as conn:
-            if conn.execute("SELECT 1 FROM users WHERE user_id=?", (target,)).fetchone():
-                conn.execute(
-                    "UPDATE users SET tier=?, daily_limit=?, daily_nameid_limit=? WHERE user_id=?",
-                    (new_tier, t["daily"], nt["daily_nameid"], target)
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO users (user_id, username, full_name, tier, daily_limit, credits, is_banned, expires_at, joined_at, lang, daily_nameid_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (target, "unknown", "User", new_tier, t["daily"], 0, 0, None, datetime.utcnow().isoformat(), "en", nt["daily_nameid"])
-                )
-            conn.execute("INSERT INTO sub_history VALUES (?,?,?,?,?)",
-                         (target, new_tier, 0, uid, datetime.utcnow().isoformat()))
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM users WHERE user_id=%s", (target,))
+                    if cur.fetchone():
+                        cur.execute(
+                            "UPDATE users SET tier=%s, daily_limit=%s, daily_nameid_limit=%s WHERE user_id=%s",
+                            (new_tier, t["daily"], nt["daily_nameid"], target)
+                        )
+                    else:
+                        cur.execute(
+                            "INSERT INTO users (user_id, username, full_name, tier, daily_limit, credits, "
+                            "is_banned, expires_at, joined_at, lang, daily_nameid_limit) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                            (target, "unknown", "User", new_tier, t["daily"], 0, 0, None,
+                             datetime.utcnow().isoformat(), "en", nt["daily_nameid"])
+                        )
+                    cur.execute("INSERT INTO sub_history VALUES (%s,%s,%s,%s,%s)",
+                                (target, new_tier, 0, uid, datetime.utcnow().isoformat()))
+                conn.commit()
+        except Exception as e:
+            log.error(f"set_tier error: {e}")
         await update.message.reply_text(f"✅ User `{target}` → *{new_tier}*.", parse_mode="Markdown", reply_markup=back_admin_kb())
         log_admin_op(uid, "set_tier", str(target), f"tier={new_tier}")
 
     elif action == "ban":
         if not parts or not parts[0].lstrip("-").isdigit():
-            await update.message.reply_text("❌ Send a valid User ID.", reply_markup=back_admin_kb()); return
+            await update.message.reply_text("❌ Send a valid User ID.", reply_markup=back_admin_kb())
+            return
         target = int(parts[0])
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute("UPDATE users SET is_banned=1 WHERE user_id=?", (target,))
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE users SET is_banned=1 WHERE user_id=%s", (target,))
+                conn.commit()
+        except Exception as e:
+            log.error(f"ban error: {e}")
         await update.message.reply_text(f"🔒 User `{target}` banned.", parse_mode="Markdown", reply_markup=back_admin_kb())
         log_admin_op(uid, "ban", str(target))
 
     elif action == "unban":
         if not parts or not parts[0].lstrip("-").isdigit():
-            await update.message.reply_text("❌ Send a valid User ID.", reply_markup=back_admin_kb()); return
+            await update.message.reply_text("❌ Send a valid User ID.", reply_markup=back_admin_kb())
+            return
         target = int(parts[0])
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute("UPDATE users SET is_banned=0 WHERE user_id=?", (target,))
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE users SET is_banned=0 WHERE user_id=%s", (target,))
+                conn.commit()
+        except Exception as e:
+            log.error(f"unban error: {e}")
         await update.message.reply_text(f"✅ User `{target}` unbanned.", parse_mode="Markdown", reply_markup=back_admin_kb())
         log_admin_op(uid, "unban", str(target))
 
     elif action == "delete_file":
         if not parts or not parts[0].lstrip("#").isdigit():
-            await update.message.reply_text("❌ Send a valid file ID.", reply_markup=back_admin_kb()); return
+            await update.message.reply_text("❌ Send a valid file ID.", reply_markup=back_admin_kb())
+            return
         fid = int(parts[0].lstrip("#"))
-        with sqlite3.connect(DB_FILE) as conn:
-            row = conn.execute("SELECT saved_name, original_name, records FROM uploaded_files WHERE id=?", (fid,)).fetchone()
-            if not row:
-                await update.message.reply_text(f"❌ File `#{fid}` not found.", parse_mode="Markdown", reply_markup=back_admin_kb()); return
-            saved_name, orig_name, record_count = row
-            conn.execute("DELETE FROM data_index WHERE source=?", (orig_name,))
-            conn.execute("DELETE FROM name_id_index WHERE source=?", (orig_name,))
-            conn.execute("DELETE FROM uploaded_files WHERE id=?", (fid,))
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT saved_name, original_name, records FROM uploaded_files WHERE id=%s", (fid,))
+                    row = cur.fetchone()
+                    if not row:
+                        await update.message.reply_text(f"❌ File `#{fid}` not found.", parse_mode="Markdown", reply_markup=back_admin_kb())
+                        return
+                    saved_name, orig_name, record_count = row
+                    cur.execute("DELETE FROM data_index WHERE source=%s", (orig_name,))
+                    cur.execute("DELETE FROM name_id_index WHERE source=%s", (orig_name,))
+                    cur.execute("DELETE FROM uploaded_files WHERE id=%s", (fid,))
+                conn.commit()
+        except Exception as e:
+            log.error(f"delete_file error: {e}")
+            await update.message.reply_text(f"❌ Error: {e}", reply_markup=back_admin_kb())
+            return
         fpath = os.path.join(FILES_DIR, saved_name)
-        if os.path.exists(fpath): os.remove(fpath)
+        if os.path.exists(fpath):
+            os.remove(fpath)
         await update.message.reply_text(
-            f"🗑️ `{orig_name}` deleted. `{record_count:,}` records removed.",
+            f"🗑️ `{orig_name}` deleted. `{(record_count or 0):,}` records removed.",
             parse_mode="Markdown", reply_markup=back_admin_kb()
         )
         log_admin_op(uid, "delete_file", orig_name, f"{record_count:,} records removed")
 
     elif action == "broadcast":
-        from telegram.error import RetryAfter, Forbidden, BadRequest
         msg_text = text.strip()
         if not msg_text:
-            await update.message.reply_text("❌ Message is empty.", reply_markup=back_admin_kb()); return
-        with sqlite3.connect(DB_FILE) as conn:
-            user_ids = [r[0] for r in conn.execute(
-                "SELECT user_id FROM users WHERE is_banned=0"
-            ).fetchall()]
+            await update.message.reply_text("❌ Message is empty.", reply_markup=back_admin_kb())
+            return
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_id FROM users WHERE is_banned=0")
+                    user_ids = [r[0] for r in cur.fetchall()]
+        except Exception:
+            user_ids = []
+
         progress = await update.message.reply_text(
             f"📢 Broadcasting to *{len(user_ids)}* users...", parse_mode="Markdown"
         )
@@ -3004,26 +3227,16 @@ async def handle_admin_text(update, context, action, text):
             except RetryAfter as e:
                 flood_waits += 1
                 wait_secs = int(e.retry_after) + 1
-                log.warning(f"FloodWait {wait_secs}s during broadcast")
-                try:
-                    await progress.edit_text(
-                        f"⏳ *FloodWait — pausing {wait_secs}s...*\n\n"
-                        f"📤 Sent so far: `{sent}` / `{len(user_ids)}`",
-                        parse_mode="Markdown"
-                    )
-                except Exception:
-                    pass
                 await asyncio.sleep(wait_secs)
-                try:  # retry once after wait
+                try:
                     await context.bot.send_message(chat_id=target_uid, text=f"📢 Message from Admin:\n\n{msg_text}")
                     sent += 1
                 except Exception:
                     failed += 1
             except (Forbidden, BadRequest):
-                failed += 1  # user blocked the bot or invalid
+                failed += 1
             except Exception:
                 failed += 1
-            # Progress update every 50 users
             if (i + 1) % 50 == 0:
                 try:
                     await progress.edit_text(
@@ -3035,6 +3248,7 @@ async def handle_admin_text(update, context, action, text):
                 except Exception:
                     pass
             await asyncio.sleep(0.05)
+
         await progress.edit_text(
             f"✅ *Broadcast Complete*\n\n"
             f"📤 Sent: `{sent}`\n"
@@ -3043,26 +3257,37 @@ async def handle_admin_text(update, context, action, text):
             f"👥 Total: `{len(user_ids)}`",
             parse_mode="Markdown", reply_markup=back_admin_kb()
         )
-        log_admin_op(uid, "broadcast", "all_users", f"sent={sent}, failed={failed}, floods={flood_waits}")
+        log_admin_op(uid, "broadcast", "all_users", f"sent={sent}, failed={failed}")
 
     elif action == "freeze":
         if len(parts) != 2 or not parts[0].lstrip("-").isdigit() or not parts[1].isdigit():
-            await update.message.reply_text("❌ Format: `USER_ID HOURS`", parse_mode="Markdown", reply_markup=back_admin_kb()); return
+            await update.message.reply_text("❌ Format: `USER_ID HOURS`", parse_mode="Markdown", reply_markup=back_admin_kb())
+            return
         target, hours = int(parts[0]), int(parts[1])
         if hours <= 0:
-            with sqlite3.connect(DB_FILE) as conn:
-                conn.execute("UPDATE users SET frozen_until=NULL WHERE user_id=?", (target,))
+            try:
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE users SET frozen_until=NULL WHERE user_id=%s", (target,))
+                    conn.commit()
+            except Exception as e:
+                log.error(f"unfreeze error: {e}")
             await update.message.reply_text(f"✅ User `{target}` unfrozen.", parse_mode="Markdown", reply_markup=back_admin_kb())
             log_admin_op(uid, "unfreeze", str(target))
         else:
             until = (datetime.utcnow() + timedelta(hours=hours)).isoformat()
-            with sqlite3.connect(DB_FILE) as conn:
-                conn.execute("UPDATE users SET frozen_until=? WHERE user_id=?", (until, target))
+            try:
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE users SET frozen_until=%s WHERE user_id=%s", (until, target))
+                    conn.commit()
+            except Exception as e:
+                log.error(f"freeze error: {e}")
             await update.message.reply_text(
-                f"🧊 User `{target}` frozen for `{hours}` hours (until `{until[:16]}`).",
+                f"🧊 User `{target}` frozen for `{hours}` hours.",
                 parse_mode="Markdown", reply_markup=back_admin_kb()
             )
-            log_admin_op(uid, "freeze", str(target), f"{hours}h until {until[:16]}")
+            log_admin_op(uid, "freeze", str(target), f"{hours}h")
             try:
                 await context.bot.send_message(
                     chat_id=target,
@@ -3071,123 +3296,171 @@ async def handle_admin_text(update, context, action, text):
                 )
             except Exception:
                 pass
-        await handle_msg_user(update, context, text); return
+
+    elif action == "msg_user":
+        await handle_msg_user(update, context, text)
 
     elif action == "adduser_inline":
         if len(parts) != 2 or not parts[0].lstrip("-").isdigit() or parts[1] not in TIERS:
             await update.message.reply_text(
                 f"❌ Format: `USER_ID TIER`\nTiers: {', '.join(TIERS)}",
                 parse_mode="Markdown", reply_markup=back_admin_kb()
-            ); return
+            )
+            return
         target, tier_val = int(parts[0]), parts[1]
         t  = TIERS[tier_val]
         nt = NAMEID_TIERS[tier_val]
-        with sqlite3.connect(DB_FILE) as conn:
-            existing = conn.execute("SELECT 1 FROM users WHERE user_id=?", (target,)).fetchone()
-            if existing:
-                conn.execute(
-                    "UPDATE users SET tier=?, daily_limit=?, daily_nameid_limit=? WHERE user_id=?",
-                    (tier_val, t["daily"], nt["daily_nameid"], target)
-                )
-                result_msg = f"✅ Updated user `{target}` → tier `{tier_val}`."
-            else:
-                conn.execute(
-                    "INSERT INTO users (user_id, username, full_name, tier, daily_limit, credits, is_banned, expires_at, joined_at, lang, daily_nameid_limit) "
-                    "VALUES (?,?,?,?,?,0,0,NULL,?,?,?)",
-                    (target, "", "", tier_val, t["daily"], datetime.utcnow().isoformat(), "en", nt["daily_nameid"])
-                )
-                result_msg = f"✅ User `{target}` added with tier `{tier_val}`."
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM users WHERE user_id=%s", (target,))
+                    if cur.fetchone():
+                        cur.execute(
+                            "UPDATE users SET tier=%s, daily_limit=%s, daily_nameid_limit=%s WHERE user_id=%s",
+                            (tier_val, t["daily"], nt["daily_nameid"], target)
+                        )
+                        result_msg = f"✅ Updated user `{target}` → tier `{tier_val}`."
+                    else:
+                        cur.execute(
+                            "INSERT INTO users (user_id, username, full_name, tier, daily_limit, credits, "
+                            "is_banned, expires_at, joined_at, lang, daily_nameid_limit) "
+                            "VALUES (%s,%s,%s,%s,%s,0,0,NULL,%s,%s,%s)",
+                            (target, "", "", tier_val, t["daily"], datetime.utcnow().isoformat(), "en", nt["daily_nameid"])
+                        )
+                        result_msg = f"✅ User `{target}` added with tier `{tier_val}`."
+                conn.commit()
+        except Exception as e:
+            log.error(f"adduser_inline error: {e}")
+            result_msg = f"❌ Error: {e}"
         await update.message.reply_text(result_msg, parse_mode="Markdown", reply_markup=back_admin_kb())
         log_admin_op(uid, "adduser_inline", str(target), tier_val)
 
     elif action == "deluser":
         if len(parts) != 1 or not parts[0].lstrip("-").isdigit():
-            await update.message.reply_text("❌ Send a valid User ID.", parse_mode="Markdown", reply_markup=back_admin_kb()); return
+            await update.message.reply_text("❌ Send a valid User ID.", parse_mode="Markdown", reply_markup=back_admin_kb())
+            return
         target = int(parts[0])
-        with sqlite3.connect(DB_FILE) as conn:
-            exists = conn.execute("SELECT full_name, username FROM users WHERE user_id=?", (target,)).fetchone()
-            if not exists:
-                await update.message.reply_text(f"❌ User `{target}` not found.", parse_mode="Markdown", reply_markup=back_admin_kb()); return
-            conn.execute("DELETE FROM users WHERE user_id=?", (target,))
-            conn.execute("DELETE FROM search_logs WHERE user_id=?", (target,))
-            conn.execute("DELETE FROM sub_history WHERE user_id=?", (target,))
-            conn.execute("DELETE FROM sub_requests WHERE user_id=?", (target,))
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT full_name, username FROM users WHERE user_id=%s", (target,))
+                    exists = cur.fetchone()
+                    if not exists:
+                        await update.message.reply_text(f"❌ User `{target}` not found.", parse_mode="Markdown", reply_markup=back_admin_kb())
+                        return
+                    cur.execute("DELETE FROM users WHERE user_id=%s", (target,))
+                    cur.execute("DELETE FROM search_logs WHERE user_id=%s", (target,))
+                    cur.execute("DELETE FROM sub_history WHERE user_id=%s", (target,))
+                    cur.execute("DELETE FROM sub_requests WHERE user_id=%s", (target,))
+                conn.commit()
+        except Exception as e:
+            log.error(f"deluser error: {e}")
+            await update.message.reply_text(f"❌ Error: {e}", reply_markup=back_admin_kb())
+            return
         fname_del = esc(exists[0] or "N/A")
         await update.message.reply_text(
-            f"✅ User `{target}` ({fname_del}) permanently deleted from DB.",
+            f"✅ User `{target}` ({fname_del}) permanently deleted.",
             parse_mode="Markdown", reply_markup=back_admin_kb()
         )
         log_admin_op(uid, "deluser", str(target), f"name={exists[0]}")
 
     elif action == "set_expiry":
         if len(parts) != 2 or not parts[0].lstrip("-").isdigit() or not parts[1].lstrip("-").isdigit():
-            await update.message.reply_text("❌ Format: `USER_ID DAYS`", parse_mode="Markdown", reply_markup=back_admin_kb()); return
+            await update.message.reply_text("❌ Format: `USER_ID DAYS`", parse_mode="Markdown", reply_markup=back_admin_kb())
+            return
         target, days = int(parts[0]), int(parts[1])
         if days <= 0:
-            exp_val = None
-            msg_out = f"✅ Expiry cleared for user `{target}`."
+            exp_val  = None
+            msg_out  = f"✅ Expiry cleared for user `{target}`."
         else:
-            exp_val = (datetime.utcnow() + timedelta(days=days)).isoformat()
-            msg_out = f"✅ User `{target}` expires in `{days}` days (`{exp_val[:10]}`)."
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute("UPDATE users SET expires_at=? WHERE user_id=?", (exp_val, target))
+            exp_val  = (datetime.utcnow() + timedelta(days=days)).isoformat()
+            msg_out  = f"✅ User `{target}` expires in `{days}` days (`{exp_val[:10]}`)."
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE users SET expires_at=%s WHERE user_id=%s", (exp_val, target))
+                conn.commit()
+        except Exception as e:
+            log.error(f"set_expiry error: {e}")
         await update.message.reply_text(msg_out, parse_mode="Markdown", reply_markup=back_admin_kb())
         log_admin_op(uid, "set_expiry", str(target), f"days={days}")
 
     elif action == "filter_logs":
         query_val = text.strip()
-        with sqlite3.connect(DB_FILE) as conn:
-            if query_val.lstrip("-").isdigit():
-                rows = conn.execute(
-                    "SELECT user_id, keyword, category, results, timestamp FROM search_logs "
-                    "WHERE user_id=? ORDER BY timestamp DESC LIMIT 30",
-                    (int(query_val),)
-                ).fetchall()
-                title = f"🔎 Logs for user `{mesc(query_val)}`"
-            else:
-                rows = conn.execute(
-                    "SELECT user_id, keyword, category, results, timestamp FROM search_logs "
-                    "WHERE keyword LIKE ? ORDER BY timestamp DESC LIMIT 30",
-                    (f"%{query_val}%",)
-                ).fetchall()
-                title = f"🔎 Logs matching `{esc(query_val)}`"
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    if query_val.lstrip("-").isdigit():
+                        cur.execute(
+                            "SELECT user_id, keyword, category, results, timestamp FROM search_logs "
+                            "WHERE user_id=%s ORDER BY timestamp DESC LIMIT 30",
+                            (int(query_val),)
+                        )
+                        title = f"🔎 Logs for user `{mesc(query_val)}`"
+                    else:
+                        cur.execute(
+                            "SELECT user_id, keyword, category, results, timestamp FROM search_logs "
+                            "WHERE keyword ILIKE %s ORDER BY timestamp DESC LIMIT 30",
+                            (f"%{query_val}%",)
+                        )
+                        title = f"🔎 Logs matching `{esc(query_val)}`"
+                    rows = cur.fetchall()
+        except Exception as e:
+            log.error(f"filter_logs error: {e}")
+            rows = []
+            title = "❌ Error"
+
         if not rows:
-            await update.message.reply_text(f"📭 No logs found for `{esc(query_val)}`.", parse_mode="Markdown", reply_markup=back_admin_kb()); return
+            await update.message.reply_text(f"📭 No logs found for `{esc(query_val)}`.", parse_mode="Markdown", reply_markup=back_admin_kb())
+            return
         text_out = f"{title}\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         for r in rows:
-            text_out += f"`{r[0]}` → `{esc(r[1][:20])}` [{esc(r[2])}] {r[3]} res @ {r[4][:10]}\n"
+            text_out += f"`{r[0]}` → `{esc(r[1][:20])}` [{esc(r[2])}] {r[3]} res @ {str(r[4])[:10]}\n"
         await update.message.reply_text(text_out[:4000], parse_mode="Markdown", reply_markup=back_admin_kb())
 
     elif action == "sub_request_approve":
-        # parts[0] = request_id, parts[1] = tier (optional override)
         if not parts or not parts[0].isdigit():
-            await update.message.reply_text("❌ Send a valid request ID.", reply_markup=back_admin_kb()); return
-        req_id = int(parts[0])
+            await update.message.reply_text("❌ Send a valid request ID.", reply_markup=back_admin_kb())
+            return
+        req_id        = int(parts[0])
         override_tier = parts[1] if len(parts) > 1 and parts[1] in TIERS else None
-        with sqlite3.connect(DB_FILE) as conn:
-            req = conn.execute("SELECT user_id, username, full_name, requested_tier FROM sub_requests WHERE id=?", (req_id,)).fetchone()
-            if not req:
-                await update.message.reply_text(f"❌ Request `#{req_id}` not found.", parse_mode="Markdown", reply_markup=back_admin_kb()); return
-            target_uid, uname, fname, req_tier = req
-            final_tier = override_tier or req_tier
-            t = TIERS[final_tier]
-            nt = NAMEID_TIERS[final_tier]
-            if conn.execute("SELECT 1 FROM users WHERE user_id=?", (target_uid,)).fetchone():
-                conn.execute(
-                    "UPDATE users SET tier=?, daily_limit=?, daily_nameid_limit=? WHERE user_id=?",
-                    (final_tier, t["daily"], nt["daily_nameid"], target_uid)
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO users (user_id, username, full_name, tier, daily_limit, credits, is_banned, expires_at, joined_at, lang, daily_nameid_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (target_uid, uname, fname, final_tier, t["daily"], 0, 0, None, datetime.utcnow().isoformat(), "en", nt["daily_nameid"])
-                )
-            conn.execute("UPDATE sub_requests SET status='approved' WHERE id=?", (req_id,))
-            conn.execute("INSERT INTO sub_history VALUES (?,?,?,?,?)",
-                         (target_uid, final_tier, 0, uid, datetime.utcnow().isoformat()))
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_id, username, full_name, requested_tier FROM sub_requests WHERE id=%s", (req_id,))
+                    req = cur.fetchone()
+                    if not req:
+                        await update.message.reply_text(f"❌ Request `#{req_id}` not found.", parse_mode="Markdown", reply_markup=back_admin_kb())
+                        return
+                    target_uid, uname, fname, req_tier = req
+                    final_tier = override_tier or req_tier
+                    t  = TIERS[final_tier]
+                    nt = NAMEID_TIERS[final_tier]
+                    cur.execute("SELECT 1 FROM users WHERE user_id=%s", (target_uid,))
+                    if cur.fetchone():
+                        cur.execute(
+                            "UPDATE users SET tier=%s, daily_limit=%s, daily_nameid_limit=%s WHERE user_id=%s",
+                            (final_tier, t["daily"], nt["daily_nameid"], target_uid)
+                        )
+                    else:
+                        cur.execute(
+                            "INSERT INTO users (user_id, username, full_name, tier, daily_limit, credits, "
+                            "is_banned, expires_at, joined_at, lang, daily_nameid_limit) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                            (target_uid, uname, fname, final_tier, t["daily"], 0, 0, None,
+                             datetime.utcnow().isoformat(), "en", nt["daily_nameid"])
+                        )
+                    cur.execute("UPDATE sub_requests SET status='approved' WHERE id=%s", (req_id,))
+                    cur.execute("INSERT INTO sub_history VALUES (%s,%s,%s,%s,%s)",
+                                (target_uid, final_tier, 0, uid, datetime.utcnow().isoformat()))
+                conn.commit()
+        except Exception as e:
+            log.error(f"sub_request_approve error: {e}")
+            await update.message.reply_text(f"❌ Error: {e}", reply_markup=back_admin_kb())
+            return
+
         try:
             user_lang = get_lang(target_uid)
-            user_st = STRINGS.get(user_lang, STRINGS["en"])
+            user_st   = STRINGS.get(user_lang, STRINGS["en"])
             await context.bot.send_message(
                 chat_id=target_uid,
                 text=user_st["sub_approved_user"].format(tier=final_tier),
@@ -3203,17 +3476,28 @@ async def handle_admin_text(update, context, action, text):
 
     elif action == "sub_request_reject":
         if not parts or not parts[0].isdigit():
-            await update.message.reply_text("❌ Send a valid request ID.", reply_markup=back_admin_kb()); return
+            await update.message.reply_text("❌ Send a valid request ID.", reply_markup=back_admin_kb())
+            return
         req_id = int(parts[0])
-        with sqlite3.connect(DB_FILE) as conn:
-            req = conn.execute("SELECT user_id FROM sub_requests WHERE id=?", (req_id,)).fetchone()
-            if not req:
-                await update.message.reply_text(f"❌ Request `#{req_id}` not found.", parse_mode="Markdown", reply_markup=back_admin_kb()); return
-            target_uid = req[0]
-            conn.execute("UPDATE sub_requests SET status='rejected' WHERE id=?", (req_id,))
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_id FROM sub_requests WHERE id=%s", (req_id,))
+                    req = cur.fetchone()
+                    if not req:
+                        await update.message.reply_text(f"❌ Request `#{req_id}` not found.", parse_mode="Markdown", reply_markup=back_admin_kb())
+                        return
+                    target_uid = req[0]
+                    cur.execute("UPDATE sub_requests SET status='rejected' WHERE id=%s", (req_id,))
+                conn.commit()
+        except Exception as e:
+            log.error(f"sub_request_reject error: {e}")
+            await update.message.reply_text(f"❌ Error: {e}", reply_markup=back_admin_kb())
+            return
+
         try:
             user_lang = get_lang(target_uid)
-            user_st = STRINGS.get(user_lang, STRINGS["en"])
+            user_st   = STRINGS.get(user_lang, STRINGS["en"])
             await context.bot.send_message(
                 chat_id=target_uid,
                 text=user_st["sub_rejected_user"],
@@ -3230,9 +3514,9 @@ async def handle_admin_text(update, context, action, text):
 # ════════════════════════════════════════════
 #     FILE UPLOAD HANDLER
 # ════════════════════════════════════════════
-MAX_UPLOAD_MB = 100  # max file size in MB
-_last_upload: dict[int, float] = {}
-_UPLOAD_COOLDOWN = 1  # seconds between uploads per admin
+MAX_UPLOAD_MB  = 100
+_last_upload: dict = {}
+_UPLOAD_COOLDOWN   = 1
 
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -3243,7 +3527,6 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Upload rate limiting
     now_t = time.monotonic()
     with _rate_limit_lock:
         last_up = _last_upload.get(uid, 0)
@@ -3252,7 +3535,8 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"⏳ Please wait *{remaining}s* before uploading another file.",
                 parse_mode="Markdown"
-            ); return
+            )
+            return
         _last_upload[uid] = now_t
 
     doc   = update.message.document
@@ -3263,9 +3547,9 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ Unsupported: `{mesc(fname)}`\nAllowed: TXT, CSV, XLSX, XLS, JSON",
             parse_mode="Markdown"
-        ); return
+        )
+        return
 
-    # File size check before download
     file_size_bytes = doc.file_size or 0
     if file_size_bytes > MAX_UPLOAD_MB * 1024 * 1024:
         await update.message.reply_text(
@@ -3273,7 +3557,8 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Max allowed: `{MAX_UPLOAD_MB} MB`\n"
             f"Your file: `{round(file_size_bytes/1024/1024, 1)} MB`",
             parse_mode="Markdown"
-        ); return
+        )
+        return
 
     msg = await update.message.reply_text(f"📥 *Downloading* `{fname}`...", parse_mode="Markdown")
 
@@ -3291,46 +3576,47 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await msg.edit_text(f"⚙️ *Parsing* `{fname}`...", parse_mode="Markdown")
 
-    # ── Duplicate file check via MD5 ──────────────────────
-    import hashlib
     file_md5 = hashlib.md5(open(save_path, "rb").read()).hexdigest()
-    with sqlite3.connect(DB_FILE) as conn:
-        dup = conn.execute(
-            "SELECT original_name FROM uploaded_files WHERE file_md5=?", (file_md5,)
-        ).fetchone()
-        if dup:
-            await msg.edit_text(
-                f"⚠️ *Duplicate File Detected!*\n\n"
-                f"This file was already uploaded as `{mesc(dup[0])}`.\n"
-                f"Upload aborted to prevent duplicate records.",
-                parse_mode="Markdown", reply_markup=back_admin_kb()
-            )
-            os.remove(save_path)
-            return
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT original_name FROM uploaded_files WHERE file_md5=%s", (file_md5,))
+                dup = cur.fetchone()
+                if dup:
+                    await msg.edit_text(
+                        f"⚠️ *Duplicate File Detected!*\n\n"
+                        f"This file was already uploaded as `{mesc(dup[0])}`.\n"
+                        f"Upload aborted to prevent duplicate records.",
+                        parse_mode="Markdown", reply_markup=back_admin_kb()
+                    )
+                    os.remove(save_path)
+                    return
+    except Exception as e:
+        log.error(f"dup check error: {e}")
 
     if ext in ("xlsx", "xls"):
         nameid_rows = parse_excel_for_name_id(save_path, fname)
         if nameid_rows:
             try:
-                with sqlite3.connect(DB_FILE) as conn:
-                    conn.execute("BEGIN")
-                    for i in range(0, len(nameid_rows), 2000):
-                        conn.executemany(
-                            "INSERT OR IGNORE INTO name_id_index (full_name, national_id, source) VALUES (?,?,?)",
-                            nameid_rows[i:i+2000]
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        for i in range(0, len(nameid_rows), 2000):
+                            batch = nameid_rows[i:i+2000]
+                            cur.executemany(
+                                "INSERT INTO name_id_index (full_name, national_id, source) VALUES (%s,%s,%s) "
+                                "ON CONFLICT DO NOTHING",
+                                batch
+                            )
+                        cur.execute(
+                            "INSERT INTO uploaded_files (saved_name, original_name, size_bytes, records, uploaded_by, uploaded_at, file_md5) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                            (save_name, fname, file_size, len(nameid_rows), uid, datetime.utcnow().isoformat(), file_md5)
                         )
-                    try:
-                        conn.execute("INSERT INTO name_fts(name_fts) VALUES('rebuild')")
-                    except Exception:
-                        pass
-                    conn.execute(
-                        "INSERT INTO uploaded_files (saved_name, original_name, size_bytes, records, uploaded_by, uploaded_at, file_md5) VALUES (?,?,?,?,?,?,?)",
-                        (save_name, fname, file_size, len(nameid_rows), uid, datetime.utcnow().isoformat(), file_md5)
-                    )
-                    conn.execute("COMMIT")
+                    conn.commit()
             except Exception as e:
-                conn.execute("ROLLBACK")
-                await msg.edit_text(f"❌ DB error: `{mesc(str(e))}`", parse_mode="Markdown"); return
+                log.error(f"nameid insert error: {e}")
+                await msg.edit_text(f"❌ DB error: `{mesc(str(e))}`", parse_mode="Markdown")
+                return
             await msg.edit_text(
                 f"✅ *Excel Indexed (Name/ID)*\n\n"
                 f"📄 File    : `{mesc(fname)}`\n"
@@ -3356,21 +3642,23 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute("BEGIN")
-            for i in range(0, len(rows), 2000):
-                conn.executemany(
-                    "INSERT INTO data_index (line, source) VALUES (?,?)",
-                    rows[i:i+2000]
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                for i in range(0, len(rows), 2000):
+                    cur.executemany(
+                        "INSERT INTO data_index (line, source) VALUES (%s,%s)",
+                        rows[i:i+2000]
+                    )
+                cur.execute(
+                    "INSERT INTO uploaded_files (saved_name, original_name, size_bytes, records, uploaded_by, uploaded_at, file_md5) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (save_name, fname, file_size, len(rows), uid, datetime.utcnow().isoformat(), file_md5)
                 )
-            conn.execute(
-                "INSERT INTO uploaded_files (saved_name, original_name, size_bytes, records, uploaded_by, uploaded_at, file_md5) VALUES (?,?,?,?,?,?,?)",
-                (save_name, fname, file_size, len(rows), uid, datetime.utcnow().isoformat(), file_md5)
-            )
-            conn.execute("COMMIT")
+            conn.commit()
     except Exception as e:
-        conn.execute("ROLLBACK")
-        await msg.edit_text(f"❌ DB error: `{mesc(str(e))}`", parse_mode="Markdown"); return
+        log.error(f"data_index insert error: {e}")
+        await msg.edit_text(f"❌ DB error: `{mesc(str(e))}`", parse_mode="Markdown")
+        return
 
     await msg.edit_text(
         f"✅ *File Indexed Successfully!*\n\n"
@@ -3390,10 +3678,11 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════
 async def cmd_hello(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    uid = user.id
+    uid  = user.id
     ensure_user(uid, user.username or "", user.first_name or "")
     if is_banned(uid):
-        await update.message.reply_text("🚫 *Your account has been banned.*\n\nIf you believe this is a mistake, please contact the admin.", parse_mode="Markdown"); return
+        await update.message.reply_text("🚫 *Your account has been banned.*", parse_mode="Markdown")
+        return
     if is_admin(uid):
         await show_admin_home(update, context, send=True)
     else:
@@ -3408,20 +3697,30 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ Use /start to open the main menu.", reply_markup=user_main_kb())
 
 async def _do_subscribe_request(uid: int, username: str, full_name: str, tier: str, context, reply_fn):
-    """Shared logic for submitting a subscription request (used by command + button)."""
     st = STRINGS.get(get_lang(uid), STRINGS["en"])
-    with sqlite3.connect(DB_FILE) as conn:
-        existing = conn.execute(
-            "SELECT id FROM sub_requests WHERE user_id=? AND status='pending'", (uid,)
-        ).fetchone()
-        if existing:
-            msg = st["sub_req_exists"].format(req_id=existing[0])
-            await reply_fn(msg, parse_mode="Markdown"); return
-        conn.execute(
-            "INSERT INTO sub_requests (user_id, username, full_name, requested_tier, timestamp) VALUES (?,?,?,?,?)",
-            (uid, username or "", full_name or "User", tier, datetime.utcnow().isoformat())
-        )
-        req_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM sub_requests WHERE user_id=%s AND status='pending'", (uid,)
+                )
+                existing = cur.fetchone()
+                if existing:
+                    msg = st["sub_req_exists"].format(req_id=existing[0])
+                    await reply_fn(msg, parse_mode="Markdown")
+                    return
+                cur.execute(
+                    "INSERT INTO sub_requests (user_id, username, full_name, requested_tier, timestamp) VALUES (%s,%s,%s,%s,%s)",
+                    (uid, username or "", full_name or "User", tier, datetime.utcnow().isoformat())
+                )
+                cur.execute("SELECT lastval()")
+                req_id = cur.fetchone()[0]
+            conn.commit()
+    except Exception as e:
+        log.error(f"_do_subscribe_request error: {e}")
+        await reply_fn("❌ Error submitting request.", parse_mode="Markdown")
+        return
+
     for admin_id in ADMIN_IDS:
         try:
             await context.bot.send_message(
@@ -3441,46 +3740,36 @@ async def _do_subscribe_request(uid: int, username: str, full_name: str, tier: s
     await reply_fn(msg, parse_mode="Markdown")
 
 async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allow users to submit a subscription request."""
     user = update.effective_user
     uid  = user.id
     ensure_user(uid, user.username or "", user.first_name or "")
     if is_banned(uid):
-        await update.message.reply_text("🚫 *Your account has been banned.*\n\nPlease contact the admin if you have any questions.", parse_mode="Markdown"); return
+        await update.message.reply_text("🚫 *Your account has been banned.*", parse_mode="Markdown")
+        return
 
     u = get_user(uid)
     current_tier = u[3] if u else "free"
-    expires_at   = u[7] if u else None
     t_current    = TIERS.get(current_tier, TIERS["free"])
-
-    exp_str = ""
-    if expires_at:
-        try:
-            exp_dt = datetime.fromisoformat(expires_at)
-            days_rem = (exp_dt - datetime.utcnow()).days
-            exp_str = f"\n📅 *Expires:* `{expires_at[:10]}` ({max(0, days_rem)}d remaining)"
-        except Exception:
-            pass
 
     args = context.args
     tier = args[0].lower() if args and args[0].lower() in TIERS else None
     if not tier or tier == "free":
         tiers_list = " | ".join(t for t in TIERS if t != "free")
-        renew_note = "\n\n🔄 *To renew your current plan, use the same tier name.*" if current_tier != "free" else ""
         await update.message.reply_text(
             f"📋 *طلب اشتراك / Subscription Request*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📦 *Current Plan:* `{current_tier}` — {esc(t_current['label'])}{exp_str}\n\n"
+            f"📦 *Current Plan:* `{current_tier}` — {esc(t_current['label'])}\n\n"
             f"استخدم: `/subscribe TIER`\n"
             f"الباقات المتاحة: `{tiers_list}`\n\n"
-            f"مثال: `/subscribe premium`{renew_note}",
+            f"مثال: `/subscribe premium`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"⭐ Basic",   callback_data="sub_req_basic"),
-                 InlineKeyboardButton(f"💎 Premium", callback_data="sub_req_premium")],
-                [InlineKeyboardButton(f"👑 VIP",     callback_data="sub_req_vip")],
+                [InlineKeyboardButton("⭐ Basic",   callback_data="sub_req_basic"),
+                 InlineKeyboardButton("💎 Premium", callback_data="sub_req_premium")],
+                [InlineKeyboardButton("👑 VIP",     callback_data="sub_req_vip")],
             ])
-        ); return
+        )
+        return
 
     await _do_subscribe_request(
         uid, user.username or "", user.first_name or "User",
@@ -3488,7 +3777,6 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return the user's Telegram ID — useful for admin operations."""
     user = update.effective_user
     await update.message.reply_text(
         f"🆔 *Your Telegram ID:*\n\n`{user.id}`\n\n"
@@ -3497,19 +3785,28 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: search user by ID or username. Usage: /finduser USER_ID or /finduser @username"""
-    if not is_admin(update.effective_user.id): return
+    if not is_admin(update.effective_user.id):
+        return
     if not context.args:
-        await update.message.reply_text("Usage: `/finduser USER_ID` or `/finduser @username`", parse_mode="Markdown"); return
+        await update.message.reply_text("Usage: `/finduser USER_ID` or `/finduser @username`", parse_mode="Markdown")
+        return
     q_val = context.args[0].lstrip("@")
-    with sqlite3.connect(DB_FILE) as conn:
-        if q_val.lstrip("-").isdigit():
-            row = conn.execute("SELECT * FROM users WHERE user_id=?", (int(q_val),)).fetchone()
-        else:
-            row = conn.execute("SELECT * FROM users WHERE username LIKE ?", (f"%{q_val}%",)).fetchone()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                if q_val.lstrip("-").isdigit():
+                    cur.execute("SELECT * FROM users WHERE user_id=%s", (int(q_val),))
+                else:
+                    cur.execute("SELECT * FROM users WHERE username ILIKE %s", (f"%{q_val}%",))
+                row = cur.fetchone()
+    except Exception as e:
+        log.error(f"cmd_finduser error: {e}")
+        row = None
+
     if not row:
-        await update.message.reply_text(f"❌ User `{mesc(q_val)}` not found.", parse_mode="Markdown"); return
-    uid_r, uname, fname, tier, daily, credits, banned, expires, joined, lang, ref_by, ref_cnt, last_s, nameid_lim = row[:14]
+        await update.message.reply_text(f"❌ User `{mesc(q_val)}` not found.", parse_mode="Markdown")
+        return
+    uid_r, uname, fname, tier, daily, credits, banned, expires, joined, lang_r, ref_by, ref_cnt, last_s, nameid_lim = row[:14]
     status = "🚫 Banned" if banned else "✅ Active"
     await update.message.reply_text(
         f"👤 *User Info*\n━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -3520,9 +3817,9 @@ async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔍 Daily    : `{daily}` left\n"
         f"🪪 Name/ID  : `{nameid_lim}` left\n"
         f"💰 Credits  : `{credits}`\n"
-        f"📅 Expires  : `{expires or 'None'}`\n"
-        f"📆 Joined   : `{(joined or '')[:10]}`\n"
-        f"🌐 Lang     : `{lang}`\n"
+        f"📅 Expires  : `{str(expires or 'None')}`\n"
+        f"📆 Joined   : `{str(joined or '')[:10]}`\n"
+        f"🌐 Lang     : `{lang_r}`\n"
         f"🔗 Referred by: `{ref_by or 'None'}`\n"
         f"👥 Referrals: `{ref_cnt}`\n"
         f"Status     : {status}",
@@ -3530,7 +3827,6 @@ async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel any pending search input."""
     context.user_data.pop("search_type", None)
     context.user_data.pop("confirmed_kw", None)
     context.user_data.pop("admin_action", None)
@@ -3540,19 +3836,15 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check bot latency."""
-    t0 = time.monotonic()
+    t0  = time.monotonic()
     msg = await update.message.reply_text("🏓 Pong!")
     latency_ms = round((time.monotonic() - t0) * 1000)
     await msg.edit_text(
-        f"🏓 *Pong!*\n"
-        f"⚡ Latency: `{latency_ms}ms`\n"
-        f"🟢 Bot is online.",
+        f"🏓 *Pong!*\n⚡ Latency: `{latency_ms}ms`\n🟢 Bot is online.",
         parse_mode="Markdown"
     )
 
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show bot version and uptime."""
     uptime_str = "N/A"
     if BOT_START_TIME:
         delta = datetime.utcnow() - BOT_START_TIME
@@ -3562,24 +3854,34 @@ async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🤖 *DATA SCANNER BOT*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📦 Version : `v5.1`\n"
+        f"📦 Version : `v5.4-PG`\n"
         f"⏱️ Uptime  : `{uptime_str}`\n"
-        f"🐍 Python  : `{__import__('sys').version.split()[0]}`",
+        f"🐍 Python  : `{__import__('sys').version.split()[0]}`\n"
+        f"🐘 DB      : PostgreSQL",
         parse_mode="Markdown"
     )
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: quick stats summary."""
-    if not is_admin(update.effective_user.id): return
-    with sqlite3.connect(DB_FILE) as conn:
-        tr = conn.execute("SELECT COUNT(*) FROM data_index").fetchone()[0]
-        tn = conn.execute("SELECT COUNT(*) FROM name_id_index").fetchone()[0]
-        tu = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        tb = conn.execute("SELECT COUNT(*) FROM users WHERE is_banned=1").fetchone()[0]
-        ts = conn.execute("SELECT COUNT(*) FROM search_logs").fetchone()[0]
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        ts_today = conn.execute("SELECT COUNT(*) FROM search_logs WHERE timestamp LIKE ?", (f"{today}%",)).fetchone()[0]
-        new_today = conn.execute("SELECT COUNT(*) FROM users WHERE joined_at LIKE ?", (f"{today}%",)).fetchone()[0]
+    if not is_admin(update.effective_user.id):
+        return
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM data_index");    tr = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM name_id_index"); tn = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM users");         tu = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM users WHERE is_banned=1"); tb = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM search_logs");   ts = cur.fetchone()[0]
+                today = datetime.utcnow().strftime("%Y-%m-%d")
+                cur.execute("SELECT COUNT(*) FROM search_logs WHERE timestamp LIKE %s", (f"{today}%",))
+                ts_today = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM users WHERE joined_at LIKE %s", (f"{today}%",))
+                new_today = cur.fetchone()[0]
+    except Exception as e:
+        log.error(f"cmd_stats error: {e}")
+        await update.message.reply_text("❌ Stats error.")
+        return
+
     await update.message.reply_text(
         f"📊 *Quick Stats*\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🗄️ DB Records : `{tr:,}`\n"
@@ -3591,23 +3893,37 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
+    if not is_admin(update.effective_user.id):
+        return
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("Usage: /adduser USER_ID TIER [CREDITS]"); return
+        await update.message.reply_text("Usage: /adduser USER_ID TIER [CREDITS]")
+        return
     target_id = int(args[0])
     tier      = args[1] if args[1] in TIERS else "free"
     credits   = int(args[2]) if len(args) > 2 else 0
-    t = TIERS[tier]
-    with sqlite3.connect(DB_FILE) as conn:
-        if conn.execute("SELECT 1 FROM users WHERE user_id=?", (target_id,)).fetchone():
-            conn.execute("UPDATE users SET tier=?, daily_limit=?, credits=credits+? WHERE user_id=?",
-                         (tier, t["daily"], credits, target_id))
-        else:
-            conn.execute(
-                "INSERT INTO users (user_id, username, full_name, tier, daily_limit, credits, is_banned, expires_at, joined_at, lang, referred_by, referral_count, last_search_at, daily_nameid_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (target_id, "unknown", "User", tier, t["daily"], credits, 0, None, datetime.utcnow().isoformat(), "en", None, 0, None, NAMEID_TIERS[tier]["daily_nameid"])
-            )
+    t  = TIERS[tier]
+    nt = NAMEID_TIERS[tier]
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM users WHERE user_id=%s", (target_id,))
+                if cur.fetchone():
+                    cur.execute(
+                        "UPDATE users SET tier=%s, daily_limit=%s, credits=credits+%s WHERE user_id=%s",
+                        (tier, t["daily"], credits, target_id)
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO users (user_id, username, full_name, tier, daily_limit, credits, "
+                        "is_banned, expires_at, joined_at, lang, referral_count, daily_nameid_limit) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (target_id, "unknown", "User", tier, t["daily"], credits, 0, None,
+                         datetime.utcnow().isoformat(), "en", 0, nt["daily_nameid"])
+                    )
+            conn.commit()
+    except Exception as e:
+        log.error(f"cmd_adduser error: {e}")
     await update.message.reply_text(f"✅ User `{target_id}` → `{tier}` + `{credits}` credits.", parse_mode="Markdown")
 
 # ════════════════════════════════════════════
@@ -3618,25 +3934,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err_msg  = str(context.error)
     log.error(f"Unhandled exception [{err_type}]: {err_msg}", exc_info=context.error)
 
-    # Friendly message to user
     if isinstance(update, Update) and update.effective_message:
         uid_ctx = update.effective_user.id if update.effective_user else "?"
         try:
             if isinstance(context.error, (BadRequest, TelegramError)):
                 user_msg = "⚠️ *Telegram error* — please try again."
             elif isinstance(context.error, asyncio.TimeoutError):
-                user_msg = "⏱️ *Request timed out.* The search took too long. Try a more specific keyword."
+                user_msg = "⏱️ *Request timed out.* Try a more specific keyword."
             else:
-                user_msg = "⚠️ *Unexpected error.* Please press /start and try again.\n\nIf it keeps happening, contact the admin."
+                user_msg = "⚠️ *Unexpected error.* Please press /start and try again."
             await update.effective_message.reply_text(user_msg, parse_mode="Markdown")
         except Exception:
             pass
     else:
         uid_ctx = "N/A"
 
-    # Notify admins with details
     import traceback
-    tb_str = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
+    tb_str   = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
     err_text = (
         f"⚠️ *Bot Error*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -3652,18 +3966,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ════════════════════════════════════════════
-#     EXPIRY CHECKER (runs on bot start)
+#     EXPIRY CHECKER
 # ════════════════════════════════════════════
 async def check_expiry_notifications(app):
-    """Notify users whose subscription expires within 3 days."""
     now = datetime.utcnow()
-    with sqlite3.connect(DB_FILE) as conn:
-        rows = conn.execute(
-            "SELECT user_id, tier, expires_at, lang FROM users WHERE expires_at IS NOT NULL AND is_banned=0"
-        ).fetchall()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id, tier, expires_at, lang FROM users WHERE expires_at IS NOT NULL AND is_banned=0"
+                )
+                rows = cur.fetchall()
+    except Exception:
+        return
+
     for uid, tier, exp_str, lang in rows:
         try:
-            exp = datetime.fromisoformat(exp_str)
+            exp       = datetime.fromisoformat(str(exp_str))
             days_left = (exp - now).days
             if 0 <= days_left <= 3:
                 is_ar = (lang or "en") == "ar"
@@ -3687,14 +4006,14 @@ async def check_expiry_notifications(app):
 #         ADMIN: MESSAGE SPECIFIC USER
 # ════════════════════════════════════════════
 async def handle_msg_user(update, context, text):
-    """Admin sends message to a specific user. Format: USER_ID message text"""
-    uid = update.effective_user.id
+    uid   = update.effective_user.id
     parts = text.strip().split(" ", 1)
     if len(parts) < 2 or not parts[0].lstrip("-").isdigit():
         await update.message.reply_text(
-            "❌ Format: `USER_ID Your message here`\nExample: `123456789 Hello, your account is ready!`",
+            "❌ Format: `USER_ID Your message here`\nExample: `123456789 Hello!`",
             parse_mode="Markdown", reply_markup=back_admin_kb()
-        ); return
+        )
+        return
     target_uid = int(parts[0])
     msg_text   = parts[1].strip()
     try:
@@ -3708,31 +4027,34 @@ async def handle_msg_user(update, context, text):
         )
         log_admin_op(uid, "msg_user", str(target_uid), msg_text[:50])
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ Failed to send: `{e}`", parse_mode="Markdown", reply_markup=back_admin_kb()
-        )
+        await update.message.reply_text(f"❌ Failed: `{e}`", parse_mode="Markdown", reply_markup=back_admin_kb())
 
 # ════════════════════════════════════════════
-#                    MAIN
+#            AUTO EXPIRE & CLEANUP
 # ════════════════════════════════════════════
 def auto_expire_subscriptions():
-    """Downgrade all users whose subscription has expired."""
     now = datetime.utcnow().isoformat()
-    with sqlite3.connect(DB_FILE) as conn:
-        expired = conn.execute(
-            "SELECT user_id, tier FROM users WHERE expires_at IS NOT NULL AND expires_at <= ? AND tier != 'free'",
-            (now,)
-        ).fetchall()
-        if expired:
-            conn.execute(
-                "UPDATE users SET tier='free', daily_limit=0, daily_nameid_limit=0, expires_at=NULL "
-                "WHERE expires_at IS NOT NULL AND expires_at <= ? AND tier != 'free'",
-                (now,)
-            )
-    return expired
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id, tier FROM users WHERE expires_at IS NOT NULL AND expires_at <= %s AND tier != 'free'",
+                    (now,)
+                )
+                expired = cur.fetchall()
+                if expired:
+                    cur.execute(
+                        "UPDATE users SET tier='free', daily_limit=0, daily_nameid_limit=0, expires_at=NULL "
+                        "WHERE expires_at IS NOT NULL AND expires_at <= %s AND tier != 'free'",
+                        (now,)
+                    )
+            conn.commit()
+        return expired
+    except Exception as e:
+        log.error(f"auto_expire_subscriptions error: {e}")
+        return []
 
 def cleanup_temp_files():
-    """Delete old tmp result files from FILES_DIR."""
     removed = 0
     try:
         for fname in os.listdir(FILES_DIR):
@@ -3740,7 +4062,7 @@ def cleanup_temp_files():
                 fpath = os.path.join(FILES_DIR, fname)
                 try:
                     age = time.time() - os.path.getmtime(fpath)
-                    if age > 3600:  # older than 1 hour
+                    if age > 3600:
                         os.remove(fpath)
                         removed += 1
                 except Exception:
@@ -3749,15 +4071,18 @@ def cleanup_temp_files():
         pass
     return removed
 
+# ════════════════════════════════════════════
+#                    MAIN
+# ════════════════════════════════════════════
 def main():
     global BOT_START_TIME
     BOT_START_TIME = datetime.utcnow()
     init_db()
 
-    # Validate token format before connecting
     if not TOKEN or not re.match(r"^\d+:[A-Za-z0-9_-]{35,}$", TOKEN):
         log.error("❌ BOT_TOKEN is missing or invalid! Set BOT_TOKEN environment variable.")
         return
+
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("hello",     cmd_hello))
@@ -3775,10 +4100,10 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    # Graceful shutdown on SIGINT/SIGTERM
     def _shutdown(signum, frame):
         log.info(f"🛑 Received signal {signum} — shutting down gracefully...")
         app.stop_running()
+
     signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
@@ -3787,24 +4112,20 @@ def main():
 
         async def daily_job():
             while True:
-                now = datetime.utcnow()
-                next_midnight = (now + timedelta(days=1)).replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
-                wait_secs = (next_midnight - now).total_seconds()
+                now           = datetime.utcnow()
+                next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                wait_secs     = (next_midnight - now).total_seconds()
                 await asyncio.sleep(wait_secs)
 
-                # 1. Reset daily limits
                 do_daily_reset()
                 log.info("✅ Daily limits reset.")
 
-                # 2. Auto-expire subscriptions + notify users
                 expired_users = auto_expire_subscriptions()
                 for uid_exp, tier_exp in expired_users:
                     try:
-                        lang = get_lang(uid_exp)
+                        lang  = get_lang(uid_exp)
                         is_ar = lang == "ar"
-                        msg = (
+                        msg   = (
                             f"⏰ *انتهى اشتراكك!*\n\nباقتك *{tier_exp}* انتهت.\nتواصل مع الأدمن للتجديد."
                             if is_ar else
                             f"⏰ *Subscription Expired!*\n\nYour *{tier_exp}* plan has ended.\nContact admin to renew."
@@ -3815,46 +4136,30 @@ def main():
                 if expired_users:
                     log.info(f"⏰ Auto-expired {len(expired_users)} subscriptions.")
 
-                # 3. Backup DB
                 try:
                     backup_db()
-                    log.info("✅ Auto DB backup done.")
+                    log.info("✅ Auto backup marker done.")
                 except Exception as e:
                     log.warning(f"Auto backup failed: {e}")
 
-                # 4. Expiry warnings (3 days)
                 await check_expiry_notifications(application)
 
-                # 5. Cleanup temp files
                 removed = cleanup_temp_files()
                 if removed:
                     log.info(f"🗑️ Cleaned up {removed} temp files.")
 
-                # 6. Weekly VACUUM (every Sunday UTC)
-                if datetime.utcnow().weekday() == 6:  # Sunday
-                    try:
-                        with sqlite3.connect(DB_FILE) as conn:
-                            conn.execute("VACUUM")
-                        log.info("🧹 Weekly DB VACUUM completed.")
-                    except Exception as e:
-                        log.warning(f"VACUUM failed: {e}")
-
         asyncio.create_task(daily_job())
 
     app.post_init = post_init
-    log.info("🚀 Data Scanner Bot v5.4 running...")
+    log.info("🚀 Data Scanner Bot v5.4-PG running with PostgreSQL...")
 
     webhook_url = os.environ.get("WEBHOOK_URL", "").strip()
     if webhook_url:
         port = int(os.environ.get("PORT", 8443))
         log.info(f"🌐 Webhook mode: {webhook_url} on port {port}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            webhook_url=webhook_url,
-        )
+        app.run_webhook(listen="0.0.0.0", port=port, webhook_url=webhook_url)
     else:
-        log.info("🔄 Polling mode (set WEBHOOK_URL env var for webhook mode)")
+        log.info("🔄 Polling mode")
         app.run_polling()
 
 if __name__ == "__main__":
