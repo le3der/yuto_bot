@@ -43,7 +43,7 @@ WHITELIST_IDS: set = set()
 BOT_START_TIME     = None
 MAINTENANCE_MODE   = False
 MAINTENANCE_MSG    = "🔧 *Bot is under maintenance.*\n\nPlease try again later."
-MAX_RESULT_LINES   = 1_000_000
+MAX_RESULT_LINES   = 10000_000
 
 os.makedirs(FILES_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -197,9 +197,9 @@ TIERS = {
 
 NAMEID_TIERS = {
     "free":    {"daily_nameid": 0,  "max_nameid": 0},
-    "basic":   {"daily_nameid": 2,  "max_nameid": 10},
-    "premium": {"daily_nameid": 5,  "max_nameid": 15},
-    "vip":     {"daily_nameid": 10, "max_nameid": 20},
+    "basic":   {"daily_nameid": 2,  "max_nameid": 100},
+    "premium": {"daily_nameid": 5,  "max_nameid": 150},
+    "vip":     {"daily_nameid": 100, "max_nameid": 2000},
 }
 
 # ════════════════════════════════════════════
